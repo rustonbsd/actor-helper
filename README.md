@@ -73,7 +73,7 @@ anyhow = "1"
 ## Example
 
 ```rust
-use actor_helper::{Actor, Handle, act_ok!, act!};
+use actor_helper::{Actor, Handle, act_ok, act};
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
@@ -128,7 +128,12 @@ struct CounterActor {
 impl Actor for CounterActor {
     async fn run(&mut self) -> Result<()> {
         loop {
-            tokio::select!
+            tokio::select! {
+                Some(action) = self.rx.recv() => {
+                    action(self).await;
+                }
+                // Your background reader.recv() etc here!
+            }
         }
     }
 }
