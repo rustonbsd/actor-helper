@@ -116,6 +116,7 @@
 //!   sequentially and a long-running action blocks the mailbox.
 //! - Do not hold references across `.await` inside actions; prefer moving values
 //!   or cloning as needed.
+mod tests;
 
 use std::{boxed, future::Future, pin::Pin};
 
@@ -187,7 +188,6 @@ where
     })
 }
 
-#[macro_export]
 /// Write an actor action that returns `anyhow::Result<T>`.
 ///
 /// This macro helps create the closure expected by [`Handle::call`] when your
@@ -196,23 +196,22 @@ where
 ///
 /// Examples
 /// ```rust,ignore
-/// # Self.api.call(act!(actor => actor.do_something())).await
-/// # // or with a block
-/// # Self.api.call(act!(actor => async move { actor.do_something().await })).await
+/// Self.api.call(act!(actor => actor.do_something())).await
+/// // or with a block
+/// Self.api.call(act!(actor => async move { actor.do_something().await })).await
 /// ```
+#[macro_export]
 macro_rules! act {
     // takes single expression that yields Result<T, anyhow::Error>
     ($actor:ident => $expr:expr) => {{
-        move |$actor| $crate::actor::into_actor_fut_res(($expr))
+        move |$actor| $crate::into_actor_fut_res(($expr))
     }};
 
     // takes a block that yields Result<T, anyhow::Error> and can use ?
     ($actor:ident => $body:block) => {{
-        move |$actor| $crate::actor::into_actor_fut_res($body)
+        move |$actor| $crate::into_actor_fut_res($body)
     }};
 }
-
-#[macro_export]
 /// Write an actor action that returns a plain `T` (wrapped as `Ok(T)`).
 ///
 /// This macro is like [`act!`] but for actions that do not naturally return
@@ -227,15 +226,16 @@ macro_rules! act {
 ///   v 
 /// })).await
 /// ```
+#[macro_export]
 macro_rules! act_ok {
     // takes single expression that yields T
     ($actor:ident => $expr:expr) => {{
-        move |$actor| $crate::actor::into_actor_fut_ok(($expr))
+        move |$actor| $crate::into_actor_fut_ok(($expr))
     }};
 
     // takes a block that yields T (no = u) map to Ok(T)
     ($actor:ident => $body:block) => {{
-        move |$actor| $crate::actor::into_actor_fut_ok($body)
+        move |$actor| $crate::into_actor_fut_ok($body)
     }};
 }
 

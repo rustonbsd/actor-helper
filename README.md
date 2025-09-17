@@ -96,13 +96,15 @@ impl Counter {
     }
 
     pub async fn increment(&self, by: i32) -> Result<()> {
-        self.handle.call(act_ok!(actor => {
+        self.handle.call(act_ok!(actor => async move {
             actor.value += by;
         })).await
     }
 
     pub async fn get(&self) -> Result<i32> {
-        self.handle.call(act_ok!(actor => actor.value)).await
+        self.handle.call(act_ok!(actor => async move { 
+            actor.value
+        })).await
     }
 
     pub async fn set_positive(&self, value: i32) -> Result<()> {
@@ -125,10 +127,9 @@ struct CounterActor {
 
 impl Actor for CounterActor {
     async fn run(&mut self) -> Result<()> {
-        while let Some(action) = self.rx.recv().await {
-            action(self).await;
+        loop {
+            tokio::select!
         }
-        Ok(())
     }
 }
 
