@@ -36,18 +36,18 @@ This design offers several advantages:
 
 The `Handle` is clonable and can be shared across threads, but all access to the actor's mutable state is serialized through the actor's mailbox, maintaining single-threaded safety.
 
-## ⚠️ Important: Keep Actions Fast
+## Important: Keep Actions Fast
 
 **Actions passed to `handle.call()` should complete quickly.** The actor processes actions sequentially, so a slow action blocks the entire mailbox:
 
 ```rust
-// ❌ DON'T: Long-running operations block the actor
+// DON'T: Long-running operations block the actor
 handle.call(act!(actor => async move {
     tokio::time::sleep(Duration::from_secs(10)).await; // Blocks other actions!
     Ok(())
 })).await?;
 
-// ✅ DO: Spawn long-running work separately
+// DO: Spawn long-running work separately
 handle.call(act_ok!(actor => {
     let data = actor.get_work_data();
     tokio::spawn(async move {
