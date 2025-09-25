@@ -25,7 +25,7 @@ A minimal, ergonomic actor runtime built on top of Tokio.
 // actor.send(Increment(5)).await?;
 
 // actor-helper approach - direct function execution:
-handle.call(act_ok!(actor => { actor.value += 5; })).await?;
+handle.call(act_ok!(actor => async move { actor.value += 5; })).await?;
 ```
 
 This design offers several advantages:
