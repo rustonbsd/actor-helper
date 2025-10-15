@@ -1,4 +1,3 @@
-
 //! Minimal, self-contained actor runtime used in this crate.
 //!
 //! This module provides a tiny, opinionated actor pattern built on top of
@@ -116,12 +115,14 @@
 //!   sequentially and a long-running action blocks the mailbox.
 //! - Do not hold references across `.await` inside actions; prefer moving values
 //!   or cloning as needed.
-mod tests;
-
 use std::{boxed, future::Future, io, pin::Pin};
 
 use futures_util::FutureExt;
-use std::sync::mpsc;
+
+pub type Sender<T> = flume::Sender<T>;
+pub type Receiver<T> = flume::Receiver<T>;
+
+pub use futures_executor::block_on;
 
 /// The unboxed future type used for actor actions.
 ///
@@ -148,9 +149,7 @@ pub type Action<A> = Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Sen
 /// Use this when your actor code already returns `Result<T, anyhow::Error>`.
 ///
 /// See also: [`into_actor_fut_ok`], [`into_actor_fut_unit_ok`].
-pub fn into_actor_fut_res<'a, Fut, T>(
-    fut: Fut,
-) -> ActorFut<'a, io::Result<T>>
+pub fn into_actor_fut_res<'a, Fut, T>(fut: Fut) -> ActorFut<'a, io::Result<T>>
 where
     Fut: Future<Output = io::Result<T>> + Send + 'a,
     T: Send + 'a,
@@ -161,9 +160,7 @@ where
 /// Convert a future yielding `T` into a boxed future yielding `anyhow::Result<T>`.
 ///
 /// This wraps the output in `Ok(T)` for convenience.
-pub fn into_actor_fut_ok<'a, Fut, T>(
-    fut: Fut,
-) -> ActorFut<'a, io::Result<T>>
+pub fn into_actor_fut_ok<'a, Fut, T>(fut: Fut) -> ActorFut<'a, io::Result<T>>
 where
     Fut: Future<Output = T> + Send + 'a,
     T: Send + 'a,
@@ -175,9 +172,7 @@ where
 /// `anyhow::Result<()>`.
 ///
 /// Convenient when an action does not return any value.
-pub fn into_actor_fut_unit_ok<'a, Fut>(
-    fut: Fut,
-) -> ActorFut<'a, io::Result<()>>
+pub fn into_actor_fut_unit_ok<'a, Fut>(fut: Fut) -> ActorFut<'a, io::Result<()>>
 where
     Fut: Future<Output = ()> + Send + 'a,
 {
@@ -202,14 +197,10 @@ where
 #[macro_export]
 macro_rules! act {
     // takes single expression that yields Result<T, anyhow::Error>
-    ($actor:ident => $expr:expr) => {{
-        move |$actor| $crate::into_actor_fut_res(($expr))
-    }};
+    ($actor:ident => $expr:expr) => {{ move |$actor| $crate::into_actor_fut_res(($expr)) }};
 
     // takes a block that yields Result<T, anyhow::Error> and can use ?
-    ($actor:ident => $body:block) => {{
-        move |$actor| $crate::into_actor_fut_res($body)
-    }};
+    ($actor:ident => $body:block) => {{ move |$actor| $crate::into_actor_fut_res($body) }};
 }
 /// Write an actor action that returns a plain `T` (wrapped as `Ok(T)`).
 ///
@@ -220,36 +211,69 @@ macro_rules! act {
 /// ```rust,ignore
 /// Self.api.call(act_ok!(actor => actor.get_value())).await
 /// // or with a block
-/// Self.api.call(act_ok!(actor => { 
-///   let v = actor.get_value(); 
-///   v 
+/// Self.api.call(act_ok!(actor => {
+///   let v = actor.get_value();
+///   v
 /// })).await
 /// ```
 #[macro_export]
 macro_rules! act_ok {
     // takes single expression that yields T
-    ($actor:ident => $expr:expr) => {{
-        move |$actor| $crate::into_actor_fut_ok(($expr))
-    }};
+    ($actor:ident => $expr:expr) => {{ move |$actor| $crate::into_actor_fut_ok(($expr)) }};
 
     // takes a block that yields T (no = u) map to Ok(T)
-    ($actor:ident => $body:block) => {{
-        move |$actor| $crate::into_actor_fut_ok($body)
-    }};
+    ($actor:ident => $body:block) => {{ move |$actor| $crate::into_actor_fut_ok($body) }};
 }
 
 /// A minimal trait implemented by concrete actor types to run their mailbox.
 ///
 /// `async fn run()` is intendet to be alive as long as the actor is alive,
 /// processing actions from the mailbox sequentially.
-/// 
+///
 /// *Note:* This is also the place to do any continuous background work *your* actor
 /// needs to perform.
 ///
 /// The returned future should poll the mailbox and execute enqueued actions
 /// until the channel closes.
+#[cfg(any(feature = "tokio", feature = "async-std"))]
 pub trait Actor: Send + 'static {
     fn run(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+}
+
+pub trait ActorSync: Send + 'static {
+    fn run_blocking(&mut self) -> io::Result<()>;
+}
+
+pub fn spawn_actor_blocking<A>(actor: A) -> std::thread::JoinHandle<io::Result<()>>
+where
+    A: ActorSync,
+{
+    std::thread::spawn(move || {
+        let mut actor = actor;
+        actor.run_blocking()
+    })
+}
+
+#[cfg(feature = "tokio")]
+pub fn spawn_actor<A>(actor: A) -> tokio::task::JoinHandle<io::Result<()>>
+where
+    A: Actor,
+{
+    tokio::task::spawn(async move {
+        let mut actor = actor;
+        actor.run().await
+    })
+}
+
+#[cfg(feature = "async-std")]
+pub fn spawn_actor<A>(actor: A) -> async_std::task::JoinHandle<io::Result<()>>
+where
+    A: Actor,
+{
+    async_std::task::spawn(async move {
+        let mut actor = actor;
+        actor.run().await
+    })
 }
 
 #[derive(Debug)]
@@ -259,7 +283,7 @@ pub trait Actor: Send + 'static {
 /// pair, then build your actor with the receiver and spawn its run loop. The
 /// handle may be cloned and used concurrently from many tasks/threads.
 pub struct Handle<A> {
-    tx: mpsc::Sender<Action<A>>,
+    tx: Sender<Action<A>>,
 }
 
 impl<A> Clone for Handle<A> {
@@ -283,25 +307,23 @@ where
     /// let actor = MyActor { /* ... */ rx };
     /// tokio::spawn(async move { let _ = actor.run().await; });
     /// ```
-    pub fn channel() -> (Self, mpsc::Receiver<Action<A>>) {
-        let (tx, rx) = mpsc::channel();
+    pub fn channel() -> (Self, Receiver<Action<A>>) {
+        let (tx, rx) = flume::unbounded();
         (Self { tx }, rx)
     }
 
-    /// Schedule an action to run on the actor and await its result.
-    ///
-    /// - `f` is a closure that receives `&mut A` and returns a boxed future
-    ///   yielding `anyhow::Result<R>`. Use the [`act!`] and [`act_ok!`] macros
-    ///   to write these concisely.
-    /// - If the actor panics while processing the action, the panic is caught
-    ///   and returned as an `anyhow::Error` with the call site location.
-    /// - If the actor task has stopped, an error is returned.
-    pub fn call<R, F>(&self, f: F) -> io::Result<R>
+    fn base_call<R, F>(
+        &self,
+        f: F,
+    ) -> io::Result<(
+        Receiver<io::Result<R>>,
+        &'static std::panic::Location<'static>,
+    )>
     where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
         R: Send + 'static,
     {
-        let (rtx, rrx) = mpsc::channel::<io::Result<R>>();
+        let (rtx, rrx) = flume::unbounded();
         let loc = std::panic::Location::caller();
 
         self.tx
@@ -333,9 +355,67 @@ where
                     let _ = rtx.send(res);
                 })
             }))
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("actor stopped (call send at {}:{})", loc.file(), loc.line())))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("actor stopped (call send at {}:{})", loc.file(), loc.line()),
+                )
+            })?;
+        Ok((rrx, loc))
+    }
 
-        rrx.recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("actor stopped (call recv at {}:{})", loc.file(), loc.line())))?
+    /// Schedule an action to run on the actor and await its result.
+    ///
+    /// - `f` is a closure that receives `&mut A` and returns a boxed future
+    ///   yielding `anyhow::Result<R>`. Use the [`act!`] and [`act_ok!`] macros
+    ///   to write these concisely.
+    /// - If the actor panics while processing the action, the panic is caught
+    ///   and returned as an `anyhow::Error` with the call site location.
+    /// - If the actor task has stopped, an error is returned.
+    pub fn call_blocking<R, F>(&self, f: F) -> io::Result<R>
+    where
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (rrx, loc) = self.base_call(f)?;
+
+        loop {
+            match rrx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(result) => return result,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("actor stopped at {}:{}", loc.file(), loc.line()),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Schedule an action to run on the actor and await its result.
+    ///
+    /// - `f` is a closure that receives `&mut A` and returns a boxed future
+    ///   yielding `anyhow::Result<R>`. Use the [`act!`] and [`act_ok!`] macros
+    ///   to write these concisely.
+    /// - If the actor panics while processing the action, the panic is caught
+    ///   and returned as an `anyhow::Error` with the call site location.
+    /// - If the actor task has stopped, an error is returned.
+    #[cfg(any(feature = "tokio", feature = "async-std"))]
+    pub async fn call<R, F>(&self, f: F) -> io::Result<R>
+    where
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (rrx, loc) = self.base_call(f)?;
+        rrx.recv_async().await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()),
+            )
+        })?
     }
 }

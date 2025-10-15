@@ -1,7 +1,6 @@
-use std::{io, sync::mpsc};
+use std::io;
 
-use actor_helper::{Actor, Handle, act_ok, act};
-use futures_executor::block_on;
+use actor_helper::{Actor, Handle, Receiver, act, act_ok};
 
 // Public API
 pub struct Counter {
@@ -11,11 +10,10 @@ pub struct Counter {
 impl Counter {
     pub fn new() -> Self {
         let (handle, rx) = Handle::channel();
-        let actor = CounterActor { value: 0, rx };
 
         std::thread::spawn(move || {
-            let mut actor = actor;
-            let _ = block_on(actor.run());
+            let mut actor = CounterActor { value: 0, rx };
+            let _ = actor.run_blocking();
         });
 
         Self { handle }
@@ -28,7 +26,7 @@ impl Counter {
     }
 
     pub fn get(&self) -> io::Result<i32> {
-        self.handle.call(act_ok!(actor => async move { 
+        self.handle.call(act_ok!(actor => async move {
             actor.value
         }))
     }
@@ -48,27 +46,28 @@ impl Counter {
 // Private actor implementation
 struct CounterActor {
     value: i32,
-    rx: mpsc::Receiver<actor_helper::Action<CounterActor>>,
+    rx: Receiver<actor_helper::Action<CounterActor>>,
 }
 
 impl Actor for CounterActor {
     async fn run(&mut self) -> io::Result<()> {
         loop {
-            if let Ok(action) = self.rx.try_recv() {
+            if let Ok(action) = self.rx.recv_async().await {
                 action(self).await;
             }
         }
     }
 }
 
-fn main() -> io::Result<()> {
+#[async_std::main]
+async fn main() -> io::Result<()> {
     let counter = Counter::new();
-    
+
     counter.increment(5)?;
     println!("Value: {}", counter.get()?);
-    
+
     counter.set_positive(10)?;
     println!("Value: {}", counter.get()?);
-    
+
     Ok(())
 }

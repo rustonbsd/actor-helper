@@ -14,3 +14,42 @@ edition = "2024"
 [dependencies]
 futures-util = "0.3"
 futures-executor = "0.3"
+flume = { version = "0.11", default-features = false}
+
+# Optional dependencies for async runtimes
+tokio = { version = "1", optional = true, default-features = false }
+async-std = { version = "1", optional = true, default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread","sync","macros", "test-util"]}
+async-std = { version = "1", default-features = false }
+
+[features]
+default = []
+tokio = ["dep:tokio","flume/async"]
+async-std = ["dep:async-std","flume/async"]
+
+[[example]]
+name = "example_tokio"
+path = "examples/example_tokio.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "example_async_std"
+path = "examples/example_async_std.rs"
+required-features = ["async-std"]
+
+[[example]]
+name = "example_sync"
+path = "examples/example_sync.rs"
+required-features = []
+
+[[test]]
+name = "test_sync"
+path = "tests/test_sync.rs"
+required-features = []
+
+[[test]]
+name = "test_tokio"
+path = "tests/test_tokio.rs"
+required-features = ["tokio"]

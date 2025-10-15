@@ -1,25 +1,21 @@
 #[cfg(test)]
-mod tests {
+mod sync_tests {
     use std::{io, sync::Arc};
 
-    use futures_executor::block_on;
-
-    use crate::{Action, Actor, Handle};
-    use std::sync::mpsc;
-
-    use crate::{act, act_ok};
+    use actor_helper::{block_on, spawn_actor_blocking, Action, ActorSync, Handle, Receiver};
+    use actor_helper::{act, act_ok};
 
     struct TestActor {
         value: i32,
-        rx: mpsc::Receiver<Action<TestActor>>,
+        rx: Receiver<Action<TestActor>>,
     }
 
-    impl Actor for TestActor {
-        async fn run(&mut self) -> io::Result<()> {
+    impl ActorSync for TestActor {
+        fn run_blocking(&mut self) -> io::Result<()> {
             loop {
                 if let Ok(action) = self.rx.recv() {
                     println!("Received an action");
-                    action(self).await;
+                    block_on(action(self));
                 }
             }
         }
@@ -33,38 +29,36 @@ mod tests {
         fn new() -> Self {
             let (handle, rx) = Handle::channel();
             let actor = TestActor { value: 0, rx };
-            std::thread::spawn(move || {
-                let mut actor = actor;
-                let _ = futures_executor::block_on(actor.run());
-            });
+            
+            let _join_handle = spawn_actor_blocking(actor);
 
             Self { handle }
         }
 
         fn set_value(&self, value: i32) -> io::Result<()> {
             self.handle
-                .call(act_ok!(actor => async move {
+                .call_blocking(act_ok!(actor => async move {
                     actor.value = value;
                 }))
         }
 
         fn get_value(&self) -> io::Result<i32> {
             self.handle
-                .call(act_ok!(actor => async move {
+                .call_blocking(act_ok!(actor => async move {
                         actor.value
                 }))
         }
 
         fn increment(&self, by: i32) -> io::Result<()> {
             self.handle
-                .call(act_ok!(actor => async move {
+                .call_blocking(act_ok!(actor => async move {
                     actor.value += by;
                 }))
         }
 
         fn set_positive(&self, value: i32) -> io::Result<()> {
             self.handle
-                .call(act!(actor => async move {
+                .call_blocking(act!(actor => async move {
                     if value <= 0 {
                         Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
                     } else {
@@ -76,7 +70,7 @@ mod tests {
 
         fn multiply(&self, factor: i32) -> io::Result<i32> {
             self.handle
-                .call(act_ok!(actor => async move {
+                .call_blocking(act_ok!(actor => async move {
                     actor.value *= factor;
                     actor.value
                 }))
@@ -162,13 +156,13 @@ mod tests {
 
     struct CounterActor {
         count: i32,
-        rx: mpsc::Receiver<Action<CounterActor>>,
+        rx: Receiver<Action<CounterActor>>,
     }
 
-    impl Actor for CounterActor {
-        async fn run(&mut self) -> io::Result<()> {
+    impl ActorSync for CounterActor {
+        fn run_blocking(&mut self) -> io::Result<()> {
             while let Ok(action) = self.rx.recv() {
-                action(self).await;
+                block_on(action(self));
             }
             Ok(())
         }
@@ -179,20 +173,18 @@ mod tests {
         let (handle, rx) = Handle::channel();
         let actor = CounterActor { count: 0, rx };
 
-        std::thread::spawn( move ||  {
-            let mut actor = actor;
-            let _ = futures_executor::block_on(actor.run());
-        });
+        
+        let _join_handle = spawn_actor_blocking(actor);
 
         handle
-            .call(act_ok!(actor => async move {
+            .call_blocking(act_ok!(actor => async move {
                 actor.count += 1;
             }))
             .unwrap();
 
         assert_eq!(
             handle
-                .call(act_ok!(actor => async move { actor.count }))
+                .call_blocking(act_ok!(actor => async move { actor.count }))
                 .unwrap(),
             1
         );
@@ -203,7 +195,7 @@ mod tests {
         let api = TestApi::new();
 
         api.handle
-            .call(act!(actor => async move {
+            .call_blocking(act!(actor => async move {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 actor.value = 999;
                 Ok(())
@@ -221,19 +213,16 @@ mod tests {
         let handle3 = handle1.clone();
 
         let actor = TestActor { value: 0, rx };
-        std::thread::spawn(move || {
-            let mut actor = actor;
-            let _ = block_on(actor.run());
-        });
+        let _join_handle = spawn_actor_blocking(actor);
 
         handle1
-            .call(act_ok!(actor => async move { actor.value += 10; }))
+            .call_blocking(act_ok!(actor => async move { actor.value += 10; }))
             .unwrap();
         handle2
-            .call(act_ok!(actor => async move { actor.value *= 2; }))
+            .call_blocking(act_ok!(actor => async move { actor.value *= 2; }))
             .unwrap();
         let result = handle3
-            .call(act_ok!(actor => async move { actor.value }))
+            .call_blocking(act_ok!(actor => async move { actor.value }))
             .unwrap();
 
         assert_eq!(result, 20);
