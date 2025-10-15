@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{Actor, Handle, Receiver, act, act_ok};
+use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
 
 // Public API
 pub struct Counter {
@@ -11,27 +11,24 @@ impl Counter {
     pub fn new() -> Self {
         let (handle, rx) = Handle::channel();
 
-        std::thread::spawn(move || {
-            let mut actor = CounterActor { value: 0, rx };
-            let _ = actor.run_blocking();
-        });
+        let _join_handle = spawn_actor(CounterActor { value: 0, rx });
 
         Self { handle }
     }
 
-    pub fn increment(&self, by: i32) -> io::Result<()> {
+    pub async fn increment(&self, by: i32) -> io::Result<()> {
         self.handle.call(act_ok!(actor => async move {
             actor.value += by;
-        }))
+        })).await
     }
 
-    pub fn get(&self) -> io::Result<i32> {
+    pub async  fn get(&self) -> io::Result<i32> {
         self.handle.call(act_ok!(actor => async move {
             actor.value
-        }))
+        })).await
     }
 
-    pub fn set_positive(&self, value: i32) -> io::Result<()> {
+    pub async  fn set_positive(&self, value: i32) -> io::Result<()> {
         self.handle.call(act!(actor => async move {
             if value <= 0 {
                 Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
@@ -39,7 +36,7 @@ impl Counter {
                 actor.value = value;
                 Ok(())
             }
-        }))
+        })).await
     }
 }
 
@@ -63,11 +60,11 @@ impl Actor for CounterActor {
 async fn main() -> io::Result<()> {
     let counter = Counter::new();
 
-    counter.increment(5)?;
-    println!("Value: {}", counter.get()?);
+    counter.increment(5).await?;
+    println!("Value: {}", counter.get().await?);
 
-    counter.set_positive(10)?;
-    println!("Value: {}", counter.get()?);
+    counter.set_positive(10).await?;
+    println!("Value: {}", counter.get().await?);
 
     Ok(())
 }

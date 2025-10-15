@@ -8,7 +8,7 @@ homepage = "https://rustonbsd.github.io/"
 readme = "README.md"
 keywords = ["networking"]
 categories = ["network-programming"]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -18,7 +18,7 @@ flume = { version = "0.11", default-features = false}
 
 # Optional dependencies for async runtimes
 tokio = { version = "1", optional = true, default-features = false }
-async-std = { version = "1", optional = true, default-features = false }
+async-std = { version = "1", optional = true, features = ["attributes"]}
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread","sync","macros", "test-util"]}
@@ -53,3 +53,8 @@ required-features = []
 name = "test_tokio"
 path = "tests/test_tokio.rs"
 required-features = ["tokio"]
+
+[[test]]
+name = "test_async_std"
+path = "tests/test_async_std.rs"
+required-features = ["async-std"]
