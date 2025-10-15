@@ -1,10 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io, sync::Arc};
+
+    use futures_executor::block_on;
 
     use crate::{Action, Actor, Handle};
-    use anyhow::{Result, anyhow};
-    use tokio::sync::mpsc;
+    use std::sync::mpsc;
 
     use crate::{act, act_ok};
 
@@ -14,12 +15,11 @@ mod tests {
     }
 
     impl Actor for TestActor {
-        async fn run(&mut self) -> Result<()> {
+        async fn run(&mut self) -> io::Result<()> {
             loop {
-                tokio::select! {
-                    Some(action) = self.rx.recv() => {
-                        action(self).await;
-                    }
+                if let Ok(action) = self.rx.recv() {
+                    println!("Received an action");
+                    action(self).await;
                 }
             }
         }
@@ -31,145 +31,133 @@ mod tests {
 
     impl TestApi {
         fn new() -> Self {
-            let (handle, rx) = Handle::channel(128);
+            let (handle, rx) = Handle::channel();
             let actor = TestActor { value: 0, rx };
-
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let mut actor = actor;
-                let _ = actor.run().await;
+                let _ = futures_executor::block_on(actor.run());
             });
 
             Self { handle }
         }
 
-        async fn set_value(&self, value: i32) -> Result<()> {
+        fn set_value(&self, value: i32) -> io::Result<()> {
             self.handle
                 .call(act_ok!(actor => async move {
                     actor.value = value;
                 }))
-                .await
         }
 
-        async fn get_value(&self) -> Result<i32> {
+        fn get_value(&self) -> io::Result<i32> {
             self.handle
                 .call(act_ok!(actor => async move {
                         actor.value
                 }))
-                .await
         }
 
-        async fn increment(&self, by: i32) -> Result<()> {
+        fn increment(&self, by: i32) -> io::Result<()> {
             self.handle
                 .call(act_ok!(actor => async move {
                     actor.value += by;
                 }))
-                .await
         }
 
-        async fn set_positive(&self, value: i32) -> Result<()> {
+        fn set_positive(&self, value: i32) -> io::Result<()> {
             self.handle
                 .call(act!(actor => async move {
                     if value <= 0 {
-                        Err(anyhow!("Value must be positive"))
+                        Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
                     } else {
                         actor.value = value;
                         Ok(())
                     }
                 }))
-                .await
         }
 
-        async fn multiply(&self, factor: i32) -> Result<i32> {
+        fn multiply(&self, factor: i32) -> io::Result<i32> {
             self.handle
                 .call(act_ok!(actor => async move {
                     actor.value *= factor;
                     actor.value
                 }))
-                .await
         }
     }
 
-    #[tokio::test]
-    async fn test_basic_operations() {
+    #[test]
+    fn test_basic_operations() {
         let api = TestApi::new();
 
-        assert_eq!(api.get_value().await.unwrap(), 0);
+        assert_eq!(api.get_value().unwrap(), 0);
 
-        api.set_value(42).await.unwrap();
-        assert_eq!(api.get_value().await.unwrap(), 42);
+        api.set_value(42).unwrap();
+        assert_eq!(api.get_value().unwrap(), 42);
 
-        api.increment(8).await.unwrap();
-        assert_eq!(api.get_value().await.unwrap(), 50);
+        api.increment(8).unwrap();
+        assert_eq!(api.get_value().unwrap(), 50);
     }
 
-    #[tokio::test]
-    async fn test_error_handling() {
+    #[test]
+    fn test_error_handling() {
         let api = TestApi::new();
 
-        let result = api.set_positive(-5).await;
+        let result = api.set_positive(-5);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("positive"));
 
-        api.set_positive(10).await.unwrap();
-        assert_eq!(api.get_value().await.unwrap(), 10);
+        api.set_positive(10).unwrap();
+        assert_eq!(api.get_value().unwrap(), 10);
     }
 
-    #[tokio::test]
-    async fn test_return_values() {
+    #[test]
+    fn test_return_values() {
         let api = TestApi::new();
 
-        api.set_value(7).await.unwrap();
-        let result = api.multiply(3).await.unwrap();
+        api.set_value(7).unwrap();
+        let result = api.multiply(3).unwrap();
         assert_eq!(result, 21);
-        assert_eq!(api.get_value().await.unwrap(), 21);
+        assert_eq!(api.get_value().unwrap(), 21);
     }
 
-    #[tokio::test]
-    async fn test_concurrent_access() {
+    #[test]
+    fn test_concurrent_access() {
         let api = Arc::new(TestApi::new());
         let mut handles = vec![];
 
         for i in 0..10 {
             let api_clone = api.clone();
-            let handle = tokio::spawn(async move {
-                api_clone.increment(i).await.unwrap();
-            });
+            let handle = api_clone.increment(i).unwrap();
             handles.push(handle);
         }
 
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        let final_value = api.get_value().await.unwrap();
+        let final_value = api.get_value().unwrap();
         assert_eq!(final_value, 45);
-    }
-
-    #[tokio::test]
-    async fn test_sequential_operations() {
+    }    
+    
+    #[test]
+    fn test_sequential_operations() {
         let api = TestApi::new();
 
-        api.set_value(1).await.unwrap();
+        api.set_value(1).unwrap();
         for _ in 0..5 {
-            let current = api.get_value().await.unwrap();
-            api.set_value(current * 2).await.unwrap();
+            let current = api.get_value().unwrap();
+            api.set_value(current * 2).unwrap();
         }
 
-        assert_eq!(api.get_value().await.unwrap(), 32);
+        assert_eq!(api.get_value().unwrap(), 32);
     }
 
-    #[tokio::test]
-    async fn test_clone_handle() {
+    #[test]
+    fn test_clone_handle() {
         let api1 = TestApi::new();
         let api2 = TestApi {
             handle: api1.handle.clone(),
         };
 
-        api1.set_value(100).await.unwrap();
-        assert_eq!(api2.get_value().await.unwrap(), 100);
+        api1.set_value(100).unwrap();
+        assert_eq!(api2.get_value().unwrap(), 100);
 
-        api2.increment(50).await.unwrap();
-        assert_eq!(api1.get_value().await.unwrap(), 150);
+        api2.increment(50).unwrap();
+        assert_eq!(api1.get_value().unwrap(), 150);
     }
 
     struct CounterActor {
@@ -178,79 +166,74 @@ mod tests {
     }
 
     impl Actor for CounterActor {
-        async fn run(&mut self) -> Result<()> {
-            while let Some(action) = self.rx.recv().await {
+        async fn run(&mut self) -> io::Result<()> {
+            while let Ok(action) = self.rx.recv() {
                 action(self).await;
             }
             Ok(())
         }
     }
 
-    #[tokio::test]
-    async fn test_shared_state() {
-        let (handle, rx) = Handle::channel(128);
+    #[test]
+    fn test_shared_state() {
+        let (handle, rx) = Handle::channel();
         let actor = CounterActor { count: 0, rx };
 
-        tokio::spawn(async move {
+        std::thread::spawn( move ||  {
             let mut actor = actor;
-            let _ = actor.run().await;
+            let _ = futures_executor::block_on(actor.run());
         });
 
         handle
             .call(act_ok!(actor => async move {
                 actor.count += 1;
             }))
-            .await
             .unwrap();
 
         assert_eq!(
             handle
                 .call(act_ok!(actor => async move { actor.count }))
-                .await
                 .unwrap(),
             1
         );
     }
 
-    #[tokio::test]
-    async fn test_async_action() {
+    #[test]
+    fn test_async_action() {
         let api = TestApi::new();
 
         api.handle
             .call(act!(actor => async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 actor.value = 999;
                 Ok(())
             }))
-            .await
             .unwrap();
 
-        assert_eq!(api.get_value().await.unwrap(), 999);
+        assert_eq!(api.get_value().unwrap(), 999);
     }
 
-    #[tokio::test]
-    async fn test_multiple_handles_same_actor() {
-        let (handle1, rx) = Handle::channel(128);
+    
+    #[test]
+    fn test_multiple_handles_same_actor() {
+        let (handle1, rx) = Handle::channel();
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
 
         let actor = TestActor { value: 0, rx };
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let mut actor = actor;
-            let _ = actor.run().await;
+            let _ = block_on(actor.run());
         });
 
         handle1
             .call(act_ok!(actor => async move { actor.value += 10; }))
-            .await
             .unwrap();
         handle2
             .call(act_ok!(actor => async move { actor.value *= 2; }))
-            .await
             .unwrap();
         let result = handle3
             .call(act_ok!(actor => async move { actor.value }))
-            .await
             .unwrap();
 
         assert_eq!(result, 20);

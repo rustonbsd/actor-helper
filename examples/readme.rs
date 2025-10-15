@@ -1,46 +1,48 @@
+use std::{io, sync::mpsc};
+
 use actor_helper::{Actor, Handle, act_ok, act};
-use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use futures_executor::block_on;
 
 // Public API
 pub struct Counter {
     handle: Handle<CounterActor>,
+    _join_handle: std::thread::JoinHandle<()>,
 }
 
 impl Counter {
     pub fn new() -> Self {
-        let (handle, rx) = Handle::channel(128);
+        let (handle, rx) = Handle::channel();
         let actor = CounterActor { value: 0, rx };
-        
-        tokio::spawn(async move {
+
+        let join_handle = std::thread::spawn(move || {
             let mut actor = actor;
-            let _ = actor.run().await;
+            let _ = block_on(actor.run());
         });
 
-        Self { handle }
+        Self { handle, _join_handle: join_handle }
     }
 
-    pub async fn increment(&self, by: i32) -> Result<()> {
+    pub fn increment(&self, by: i32) -> io::Result<()> {
         self.handle.call(act_ok!(actor => async move {
             actor.value += by;
-        })).await
+        }))
     }
 
-    pub async fn get(&self) -> Result<i32> {
+    pub fn get(&self) -> io::Result<i32> {
         self.handle.call(act_ok!(actor => async move { 
             actor.value
-        })).await
+        }))
     }
 
-    pub async fn set_positive(&self, value: i32) -> Result<()> {
+    pub fn set_positive(&self, value: i32) -> io::Result<()> {
         self.handle.call(act!(actor => async move {
             if value <= 0 {
-                Err(anyhow!("Value must be positive"))
+                Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
             } else {
                 actor.value = value;
                 Ok(())
             }
-        })).await
+        }))
     }
 }
 
@@ -51,27 +53,23 @@ struct CounterActor {
 }
 
 impl Actor for CounterActor {
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) -> io::Result<()> {
         loop {
-            tokio::select! {
-                Some(action) = self.rx.recv() => {
-                    action(self).await;
-                }
-                // Your background reader.recv() etc here!
+            if let Ok(action) = self.rx.try_recv() {
+                action(self).await;
             }
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> io::Result<()> {
     let counter = Counter::new();
     
-    counter.increment(5).await?;
-    println!("Value: {}", counter.get().await?);
+    counter.increment(5)?;
+    println!("Value: {}", counter.get()?);
     
-    counter.set_positive(10).await?;
-    println!("Value: {}", counter.get().await?);
+    counter.set_positive(10)?;
+    println!("Value: {}", counter.get()?);
     
     Ok(())
 }

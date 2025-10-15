@@ -118,11 +118,10 @@
 //!   or cloning as needed.
 mod tests;
 
-use std::{boxed, future::Future, pin::Pin};
+use std::{boxed, future::Future, io, pin::Pin};
 
-use anyhow::anyhow;
-use futures::FutureExt;
-use tokio::sync::{mpsc, oneshot};
+use futures_util::FutureExt;
+use std::sync::mpsc;
 
 /// The unboxed future type used for actor actions.
 ///
@@ -151,9 +150,9 @@ pub type Action<A> = Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Sen
 /// See also: [`into_actor_fut_ok`], [`into_actor_fut_unit_ok`].
 pub fn into_actor_fut_res<'a, Fut, T>(
     fut: Fut,
-) -> ActorFut<'a, anyhow::Result<T>>
+) -> ActorFut<'a, io::Result<T>>
 where
-    Fut: Future<Output = anyhow::Result<T>> + Send + 'a,
+    Fut: Future<Output = io::Result<T>> + Send + 'a,
     T: Send + 'a,
 {
     Box::pin(fut)
@@ -164,12 +163,12 @@ where
 /// This wraps the output in `Ok(T)` for convenience.
 pub fn into_actor_fut_ok<'a, Fut, T>(
     fut: Fut,
-) -> ActorFut<'a, anyhow::Result<T>>
+) -> ActorFut<'a, io::Result<T>>
 where
     Fut: Future<Output = T> + Send + 'a,
     T: Send + 'a,
 {
-    Box::pin(async move { Ok::<T, anyhow::Error>(fut.await) })
+    Box::pin(async move { Ok::<T, io::Error>(fut.await) })
 }
 
 /// Convert a unit future (`Future<Output = ()>`) into a boxed future yielding
@@ -178,13 +177,13 @@ where
 /// Convenient when an action does not return any value.
 pub fn into_actor_fut_unit_ok<'a, Fut>(
     fut: Fut,
-) -> ActorFut<'a, anyhow::Result<()>>
+) -> ActorFut<'a, io::Result<()>>
 where
     Fut: Future<Output = ()> + Send + 'a,
 {
     Box::pin(async move {
         fut.await;
-        Ok::<(), anyhow::Error>(())
+        Ok::<(), io::Error>(())
     })
 }
 
@@ -250,7 +249,7 @@ macro_rules! act_ok {
 /// The returned future should poll the mailbox and execute enqueued actions
 /// until the channel closes.
 pub trait Actor: Send + 'static {
-    fn run(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send;
+    fn run(&mut self) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 #[derive(Debug)]
@@ -284,8 +283,8 @@ where
     /// let actor = MyActor { /* ... */ rx };
     /// tokio::spawn(async move { let _ = actor.run().await; });
     /// ```
-    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<Action<A>>) {
-        let (tx, rx) = mpsc::channel(capacity);
+    pub fn channel() -> (Self, mpsc::Receiver<Action<A>>) {
+        let (tx, rx) = mpsc::channel();
         (Self { tx }, rx)
     }
 
@@ -297,12 +296,12 @@ where
     /// - If the actor panics while processing the action, the panic is caught
     ///   and returned as an `anyhow::Error` with the call site location.
     /// - If the actor task has stopped, an error is returned.
-    pub async fn call<R, F>(&self, f: F) -> anyhow::Result<R>
+    pub fn call<R, F>(&self, f: F) -> io::Result<R>
     where
-        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, anyhow::Result<R>> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
         R: Send + 'static,
     {
-        let (rtx, rrx) = oneshot::channel::<anyhow::Result<R>>();
+        let (rtx, rrx) = mpsc::channel::<io::Result<R>>();
         let loc = std::panic::Location::caller();
 
         self.tx
@@ -319,11 +318,14 @@ where
                             } else {
                                 "unknown panic".to_string()
                             };
-                            anyhow!(
-                                "panic in actor call at {}:{}: {}",
-                                loc.file(),
-                                loc.line(),
-                                msg
+                            io::Error::new(
+                                io::ErrorKind::Other,
+                                format!(
+                                    "panic in actor call at {}:{}: {}",
+                                    loc.file(),
+                                    loc.line(),
+                                    msg
+                                ),
                             )
                         })
                         .and_then(|r| r);
@@ -331,10 +333,9 @@ where
                     let _ = rtx.send(res);
                 })
             }))
-            .await
-            .map_err(|_| anyhow!("actor stopped (call send at {}:{})", loc.file(), loc.line()))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("actor stopped (call send at {}:{})", loc.file(), loc.line())))?;
 
-        rrx.await
-            .map_err(|_| anyhow!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))?
+        rrx.recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, format!("actor stopped (call recv at {}:{})", loc.file(), loc.line())))?
     }
 }
