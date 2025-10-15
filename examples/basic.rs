@@ -6,7 +6,6 @@ use futures_executor::block_on;
 // Public API
 pub struct Counter {
     handle: Handle<CounterActor>,
-    _join_handle: std::thread::JoinHandle<()>,
 }
 
 impl Counter {
@@ -14,12 +13,12 @@ impl Counter {
         let (handle, rx) = Handle::channel();
         let actor = CounterActor { value: 0, rx };
 
-        let join_handle = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut actor = actor;
             let _ = block_on(actor.run());
         });
 
-        Self { handle, _join_handle: join_handle }
+        Self { handle }
     }
 
     pub fn increment(&self, by: i32) -> io::Result<()> {
