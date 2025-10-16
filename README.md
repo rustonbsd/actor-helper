@@ -4,15 +4,15 @@
 [![Documentation](https://docs.rs/actor-helper/badge.svg)](https://docs.rs/actor-helper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A minimal, ergonomic actor runtime built on top of Tokio.
-
-
+A minimal, opinionated actor framework for Rust.
 
 ## Features
 
+- **Runtime agnostic**: Works with `tokio`, `async-std`, or blocking threads
+- **Dynamic error types**: Use `io::Error`, `anyhow::Error`, `String`, or custom types
 - **Simple API**: Create actors with just a handle and receiver
 - **Type-safe**: Compile-time guarantees for actor interactions
-- **Panic-safe**: Automatic panic capture and error propagation
+- **Panic-safe**: Automatic panic capture and error propagation with location tracking
 - **Ergonomic macros**: `act!` and `act_ok!` for writing actor actions
 - **Thread-safe**: Clone handles to communicate from anywhere
 
@@ -34,30 +34,60 @@ This design offers several advantages:
 - **Flexibility**: Execute any logic on the actor state, including async operations
 - **Simplicity**: Less boilerplate, more readable code
 
-The `Handle` is clonable and can be shared across threads, but all access to the actor's mutable state is serialized through the actor's mailbox, maintaining single-threaded safety.
+The `Handle` is cloneable and can be shared across threads, but all access to the actor's mutable state is serialized through the actor's mailbox, maintaining single-threaded safety.
 
 ## Important: Keep Actions Fast
 
-**Actions passed to `handle.call()` should complete quickly.** The actor processes actions sequentially, so a slow action blocks the entire mailbox:
+**Actions run sequentially and should complete quickly.** A slow action blocks the entire actor:
 
 ```rust
-// DON'T: Long-running operations block the actor
-handle.call(act!(actor => async move {
-    tokio::time::sleep(Duration::from_secs(10)).await; // Blocks other actions!
-    Ok(())
-})).await?;
+// DON'T: Long-running work blocks the actor
+pub async fn process(&self) -> io::Result<()> {
+    self.handle.call(act!(actor => async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;  // Blocks everything!
+        Ok(())
+    })).await
+}
 
-// DO: Spawn long-running work separately
-handle.call(act_ok!(actor => {
-    let data = actor.get_work_data();
-    tokio::spawn(async move {
-        // Long operation runs independently
-        process_data(data).await;
-    });
-})).await?;
+// DO: Get state, process outside, write back
+pub async fn process(&self) -> io::Result<()> {
+    let data = self.handle.call(act_ok!(actor => async move {
+        actor.data.clone()
+    })).await?;
+    
+    // Slow work happens outside
+    let new_data = expensive_computation(&data).await;
+    
+    self.handle.call(act_ok!(actor => async move {
+        actor.data = new_data;
+    })).await
+}
+
+// DO: Quick mutations inside
+pub async fn increment(&self) -> io::Result<()> {
+    self.handle.call(act_ok!(actor => async move {
+        actor.value += 1;  // Fast
+    })).await
+}
+
+// DO: Use tokio::select! for background tasks in run()
+impl Actor<io::Error> for CounterActor {
+    async fn run(&mut self) -> io::Result<()> {
+        loop {
+            tokio::select! {
+                Ok(action) = self.rx.recv_async() => {
+                    action(self).await;
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Received Ctrl+C, shutting down.");
+                    break;
+                }
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
+    }
+}
 ```
-
-For background work or continuous tasks, implement them in the actor's `run()` method using `tokio::select!`.
 
 ## Quick Start
 
@@ -65,48 +95,168 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-actor-helper = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-anyhow = "1"
+actor-helper = { version = "0.2.0", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 ```
 
-## Example
+## Example with tokio
 
 ```rust
-use actor_helper::{Actor, Handle, act_ok, act};
-use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use std::io;
+use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
 
 // Public API
 pub struct Counter {
-    handle: Handle<CounterActor>,
+    handle: Handle<CounterActor, io::Error>,
 }
 
 impl Counter {
     pub fn new() -> Self {
-        let (handle, rx) = Handle::channel(128);
-        let actor = CounterActor { value: 0, rx };
-        
-        tokio::spawn(async move {
-            let mut actor = actor;
-            let _ = actor.run().await;
-        });
-
+        let (handle, rx) = Handle::channel();
+        spawn_actor(CounterActor { value: 0, rx });
         Self { handle }
     }
 
-    pub async fn increment(&self, by: i32) -> Result<()> {
+    pub async fn increment(&self, by: i32) -> io::Result<()> {
         self.handle.call(act_ok!(actor => async move {
             actor.value += by;
         })).await
     }
 
-    pub async fn get(&self) -> Result<i32> {
+    pub async fn get(&self) -> io::Result<i32> {
         self.handle.call(act_ok!(actor => async move { 
             actor.value
         })).await
     }
 
+    pub async fn set_positive(&self, value: i32) -> io::Result<()> {
+        self.handle.call(act!(actor => async move {
+            if value <= 0 {
+                Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+            } else {
+                actor.value = value;
+                Ok(())
+            }
+        })).await
+    }
+}
+
+// Private actor implementation
+struct CounterActor {
+    value: i32,
+    rx: Receiver<actor_helper::Action<CounterActor>>,
+}
+
+impl Actor<io::Error> for CounterActor {
+    async fn run(&mut self) -> io::Result<()> {
+        loop {
+            tokio::select! {
+                Ok(action) = self.rx.recv_async() => {
+                    action(self).await;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
+                // Your background tasks here!
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
+    }
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let counter = Counter::new();
+    
+    counter.increment(5).await?;
+    println!("Value: {}", counter.get().await?);
+    
+    counter.set_positive(10).await?;
+    println!("Value: {}", counter.get().await?);
+    
+    Ok(())
+}
+```
+
+## Blocking/Sync Example
+
+No async runtime required:
+
+```rust
+use std::io;
+use actor_helper::{ActorSync, Handle, Receiver, act_ok, spawn_actor_blocking, block_on};
+
+pub struct Counter {
+    handle: Handle<CounterActor, io::Error>,
+}
+
+impl Counter {
+    pub fn new() -> Self {
+        let (handle, rx) = Handle::channel();
+        spawn_actor_blocking(CounterActor { value: 0, rx });
+        Self { handle }
+    }
+
+    pub fn increment(&self, by: i32) -> io::Result<()> {
+        self.handle.call_blocking(act_ok!(actor => async move {
+            actor.value += by;
+        }))
+    }
+
+    pub fn get(&self) -> io::Result<i32> {
+        self.handle.call_blocking(act_ok!(actor => async move {
+            actor.value
+        }))
+    }
+}
+
+struct CounterActor {
+    value: i32,
+    rx: Receiver<actor_helper::Action<CounterActor>>,
+}
+
+impl ActorSync<io::Error> for CounterActor {
+    fn run_blocking(&mut self) -> io::Result<()> {
+        loop {
+            if let Ok(action) = self.rx.recv() {
+                block_on(action(self));
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
+    }
+}
+
+fn main() -> io::Result<()> {
+    let counter = Counter::new();
+    counter.increment(5)?;
+    println!("Value: {}", counter.get()?);
+    Ok(())
+}
+```
+
+## Using Custom Error Types
+
+### With `anyhow::Error`
+
+Enable the feature:
+
+```toml
+[dependencies]
+actor-helper = { version = "0.2.0", features = ["anyhow", "tokio"] }
+anyhow = "1"
+```
+
+Then use it in your code:
+
+```rust
+use anyhow::{anyhow, Result};
+use actor_helper::{Actor, Handle, Receiver, act, spawn_actor};
+
+pub struct Counter {
+    handle: Handle<CounterActor, anyhow::Error>,
+}
+
+impl Counter {
     pub async fn set_positive(&self, value: i32) -> Result<()> {
         self.handle.call(act!(actor => async move {
             if value <= 0 {
@@ -119,38 +269,63 @@ impl Counter {
     }
 }
 
-// Private actor implementation
 struct CounterActor {
     value: i32,
-    rx: mpsc::Receiver<actor_helper::Action<CounterActor>>,
+    rx: Receiver<actor_helper::Action<CounterActor>>,
 }
 
-impl Actor for CounterActor {
+impl Actor<anyhow::Error> for CounterActor {
     async fn run(&mut self) -> Result<()> {
         loop {
             tokio::select! {
-                Some(action) = self.rx.recv() => {
-                    action(self).await;
-                }
-                // Your background reader.recv() etc here!
+                Ok(action) = self.rx.recv_async() => action(self).await,
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
+        Err(anyhow::anyhow!("Actor stopped"))
+    }
+}
+```
+
+### Custom Error Type
+
+Implement the `ActorError` trait:
+
+```rust
+use actor_helper::ActorError;
+
+#[derive(Debug)]
+enum MyError {
+    ActorPanic(String),
+    // ... your error variants
+}
+
+impl ActorError for MyError {
+    fn from_actor_message(msg: String) -> Self {
+        MyError::ActorPanic(msg)
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let counter = Counter::new();
-    
-    counter.increment(5).await?;
-    println!("Value: {}", counter.get().await?);
-    
-    counter.set_positive(10).await?;
-    println!("Value: {}", counter.get().await?);
-    
-    Ok(())
-}
+// Now use Handle<MyActor, MyError>
 ```
+
+## async-std Support
+
+```toml
+[dependencies]
+actor-helper = { version = "0.2.0", features = ["async-std"] }
+async-std = { version = "1", features = ["attributes"] }
+```
+
+The API is identical to tokio, just use `#[async_std::main]` instead.
+
+## How It Works
+
+1. **Create a handle and receiver**: `Handle::channel()` creates an unbounded channel pair
+2. **Spawn the actor**: Pass the receiver to your actor and spawn it with `spawn_actor()` or `spawn_actor_blocking()`
+3. **Call actions**: Use `handle.call()` or `handle.call_blocking()` with `act!` or `act_ok!` macros
+4. **Sequential execution**: Actions are processed one at a time by the actor
+5. **Panic safety**: Panics are caught and converted to errors with the call site location
 
 ## License
 
