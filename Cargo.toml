@@ -17,7 +17,7 @@ futures-executor = "0.3"
 flume = { version = "0.11", default-features = false}
 
 # Optional dependencies for async runtimes
-tokio = { version = "1", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 async-std = { version = "1", optional = true, features = ["attributes"]}
 
 [dev-dependencies]

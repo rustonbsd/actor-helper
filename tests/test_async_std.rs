@@ -1,12 +1,11 @@
 #[cfg(test)]
 #[cfg(feature = "async-std")]
-mod tokio_tests {
+mod async_std_tests {
     
 use std::{io, sync::Arc};
 
 use actor_helper::{Action, Actor, Handle, Receiver, spawn_actor};
 use actor_helper::{act, act_ok};
-use tokio;
 
 struct TestActor {
     value: i32,
@@ -76,7 +75,7 @@ impl TestApi {
     }
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_basic_operations() {
     let api = TestApi::new();
 
@@ -89,7 +88,7 @@ async fn test_basic_operations() {
     assert_eq!(api.get_value().await.unwrap(), 50);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_error_handling() {
     let api = TestApi::new();
 
@@ -101,7 +100,7 @@ async fn test_error_handling() {
     assert_eq!(api.get_value().await.unwrap(), 10);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_return_values() {
     let api = TestApi::new();
 
@@ -111,7 +110,7 @@ async fn test_return_values() {
     assert_eq!(api.get_value().await.unwrap(), 21);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_concurrent_access() {
     let api = Arc::new(TestApi::new());
     let mut handles = vec![];
@@ -126,7 +125,7 @@ async fn test_concurrent_access() {
     assert_eq!(final_value, 45);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_sequential_operations() {
     let api = TestApi::new();
 
@@ -139,7 +138,7 @@ async fn test_sequential_operations() {
     assert_eq!(api.get_value().await.unwrap(), 32);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_clone_handle() {
     let api1 = TestApi::new();
     let api2 = TestApi {
@@ -170,7 +169,7 @@ impl Actor for CounterActor {
     }
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_shared_state() {
     let (handle, rx) = Handle::channel();
     let actor = CounterActor { count: 0, rx };
@@ -193,7 +192,7 @@ async fn test_shared_state() {
     );
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_async_action() {
     let api = TestApi::new();
 
@@ -209,7 +208,7 @@ async fn test_async_action() {
     assert_eq!(api.get_value().await.unwrap(), 999);
 }
 
-#[tokio::test]
+#[async_std::test]
 async fn test_multiple_handles_same_actor() {
     let (handle1, rx) = Handle::channel();
     let handle2 = handle1.clone();
