@@ -19,6 +19,7 @@ flume = { version = "0.11", default-features = false}
 # Optional dependencies for async runtimes
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 async-std = { version = "1", optional = true, features = ["attributes"]}
+anyhow = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread","sync","macros", "test-util"]}
@@ -28,6 +29,9 @@ async-std = { version = "1", default-features = false }
 default = []
 tokio = ["dep:tokio","flume/async"]
 async-std = ["dep:async-std","flume/async"]
+
+# Error impls
+anyhow = ["dep:anyhow"]
 
 [[example]]
 name = "example_tokio"

@@ -143,6 +143,41 @@ pub type Receiver<T> = flume::Receiver<T>;
 /// in a blocking context.
 pub use futures_executor::block_on;
 
+/// Trait for converting panic/actor-stop messages into error types.
+///
+/// This trait is automatically implemented for `io::Error`. If you want to use
+/// custom error types with `Handle<A, E>`, implement this trait for your error type.
+pub trait ActorError: Sized + Send + 'static {
+    /// Convert an error message to your error type
+    fn from_actor_message(msg: String) -> Self;
+}
+
+// Implementations for common types
+impl ActorError for io::Error {
+    fn from_actor_message(msg: String) -> Self {
+        io::Error::new(io::ErrorKind::Other, msg)
+    }
+}
+
+#[cfg(feature = "anyhow")]
+impl ActorError for anyhow::Error {
+    fn from_actor_message(msg: String) -> Self {
+        anyhow::anyhow!(msg)
+    }
+}
+
+impl ActorError for String {
+    fn from_actor_message(msg: String) -> Self {
+        msg
+    }
+}
+
+impl ActorError for Box<dyn std::error::Error + Send + Sync> {
+    fn from_actor_message(msg: String) -> Self {
+        Box::new(io::Error::new(io::ErrorKind::Other, msg))
+    }
+}
+
 /// The unboxed future type used for actor actions (before boxing).
 ///
 /// This is a `Send` future that returns `T`. In practice, you'll almost always
@@ -167,7 +202,8 @@ pub type ActorFut<'a, T> = Pin<boxed::Box<PreBoxActorFut<'a, T>>>;
 /// itself always returns `()` to the actor's run loop.
 ///
 /// Use the `act!` and `act_ok!` macros to create actions conveniently.
-pub type Action<A> = Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
+pub type Action<A> =
+    Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
 
 /// Convert a future yielding `io::Result<T>` into a boxed [`ActorFut`].
 ///
@@ -494,16 +530,20 @@ where
     ///
     /// The wrapped action executes `f(actor)`, catches any panics, and sends
     /// the result (or panic error) back through the oneshot channel.
-    fn base_call<R, F>(
+    fn base_call<R, F, E>(
         &self,
         f: F,
-    ) -> io::Result<(
-        Receiver<io::Result<R>>,
-        &'static std::panic::Location<'static>,
-    )>
+    ) -> Result<
+        (
+            Receiver<Result<R, E>>,
+            &'static std::panic::Location<'static>,
+        ),
+        E,
+    >
     where
-        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
+        E: ActorError,
     {
         let (rtx, rrx) = flume::unbounded();
         let loc = std::panic::Location::caller();
@@ -512,40 +552,36 @@ where
             .send(Box::new(move |actor: &mut A| {
                 Box::pin(async move {
                     // Execute the action and catch any panics
-                    let res = std::panic::AssertUnwindSafe(async move { f(actor).await })
+                    let panic_result = std::panic::AssertUnwindSafe(async move { f(actor).await })
                         .catch_unwind()
-                        .await
-                        .map_err(|p| {
+                        .await;
+
+                    let res = match panic_result {
+                        Ok(action_result) => action_result,
+                        Err(panic_payload) => {
                             // Convert panic payload to error message
-                            let msg = if let Some(s) = p.downcast_ref::<&str>() {
+                            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
                                 (*s).to_string()
-                            } else if let Some(s) = p.downcast_ref::<String>() {
+                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
                                 s.clone()
                             } else {
                                 "unknown panic".to_string()
                             };
-                            io::Error::new(
-                                io::ErrorKind::Other,
-                                format!(
-                                    "panic in actor call at {}:{}: {}",
-                                    loc.file(),
-                                    loc.line(),
-                                    msg
-                                ),
-                            )
-                        })
-                        .and_then(|r| r);
+                            Err(E::from_actor_message(format!(
+                                "panic in actor call at {}:{}: {}",
+                                loc.file(),
+                                loc.line(),
+                                msg
+                            )))
+                        }
+                    };
 
                     // Send result back to caller (ignore send errors - caller may have dropped)
                     let _ = rtx.send(res);
                 })
             }))
             .map_err(|_| {
-                // Actor's receiver was dropped, meaning the actor stopped
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("actor stopped (call send at {}:{})", loc.file(), loc.line()),
-                )
+                E::from_actor_message(format!("actor stopped (call send at {}:{})", loc.file(), loc.line()))
             })?;
         Ok((rrx, loc))
     }
@@ -579,10 +615,11 @@ where
     ///     actor.value
     /// }))?;
     /// ```
-    pub fn call_blocking<R, F>(&self, f: F) -> io::Result<R>
+    pub fn call_blocking<R, F, E>(&self, f: F) -> Result<R, E>
     where
-        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
+        E: ActorError,
     {
         let (rrx, loc) = self.base_call(f)?;
 
@@ -595,10 +632,11 @@ where
                     continue;
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("actor stopped at {}:{}", loc.file(), loc.line()),
-                    ));
+                    return Err(E::from_actor_message(format!(
+                        "actor stopped at {}:{}",
+                        loc.file(),
+                        loc.line()
+                    )));
                 }
             }
         }
@@ -632,17 +670,15 @@ where
     /// })).await?;
     /// ```
     #[cfg(any(feature = "tokio", feature = "async-std"))]
-    pub async fn call<R, F>(&self, f: F) -> io::Result<R>
+    pub async fn call<R, F, E>(&self, f: F) -> Result<R, E>
     where
-        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, io::Result<R>> + Send + 'static,
+        F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
+        E: ActorError,
     {
         let (rrx, loc) = self.base_call(f)?;
         rrx.recv_async().await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()),
-            )
+            E::from_actor_message(format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))
         })?
     }
 }
