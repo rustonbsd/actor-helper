@@ -69,9 +69,25 @@ pub async fn increment(&self) -> io::Result<()> {
         actor.value += 1;  // Fast
     })).await
 }
-```
 
-For background tasks, use `tokio::select!` in the actor's `run()` method
+// DO: Use tokio::select! for background tasks in run()
+impl Actor<io::Error> for CounterActor {
+    async fn run(&mut self) -> io::Result<()> {
+        loop {
+            tokio::select! {
+                Ok(action) = self.rx.recv_async() => {
+                    action(self).await;
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Received Ctrl+C, shutting down.");
+                    break;
+                }
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
+    }
+}
+```
 
 ## Quick Start
 
@@ -79,7 +95,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-actor-helper = { version = "0.2", features = ["tokio"] }
+actor-helper = { version = "0.2.0", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 ```
 
@@ -138,9 +154,13 @@ impl Actor<io::Error> for CounterActor {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
                 }
+                _ = tokio::signal::ctrl_c() => {
+                    break;
+                }
                 // Your background tasks here!
             }
         }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
     }
 }
 
@@ -202,6 +222,7 @@ impl ActorSync<io::Error> for CounterActor {
                 block_on(action(self));
             }
         }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
     }
 }
 
@@ -221,7 +242,7 @@ Enable the feature:
 
 ```toml
 [dependencies]
-actor-helper = { version = "0.2", features = ["anyhow", "tokio"] }
+actor-helper = { version = "0.2.0", features = ["anyhow", "tokio"] }
 anyhow = "1"
 ```
 
@@ -258,8 +279,10 @@ impl Actor<anyhow::Error> for CounterActor {
         loop {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => action(self).await,
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
+        Err(anyhow::anyhow!("Actor stopped"))
     }
 }
 ```
@@ -290,7 +313,7 @@ impl ActorError for MyError {
 
 ```toml
 [dependencies]
-actor-helper = { version = "0.2", features = ["async-std"] }
+actor-helper = { version = "0.2.0", features = ["async-std"] }
 async-std = { version = "1", features = ["attributes"] }
 ```
 
@@ -303,8 +326,6 @@ The API is identical to tokio, just use `#[async_std::main]` instead.
 3. **Call actions**: Use `handle.call()` or `handle.call_blocking()` with `act!` or `act_ok!` macros
 4. **Sequential execution**: Actions are processed one at a time by the actor
 5. **Panic safety**: Panics are caught and converted to errors with the call site location
-
-The unbounded channel helps prevent one specific deadlock scenario where an actor needs to call itself, **but it doesn't prevent all possible deadlock situations**.
 
 ## License
 

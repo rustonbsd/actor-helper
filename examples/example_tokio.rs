@@ -59,9 +59,14 @@ impl Actor<io::Error> for CounterActor {
             tokio::select! {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Received Ctrl+C, shutting down.");
+                    break;
                 }
             }
         }
+        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
     }
 }
 

@@ -79,7 +79,6 @@
 //!
 //! - Actions run sequentially, long tasks block the mailbox
 //! - Panics are caught and converted to errors with location info
-//! - Unbounded channels prevent deadlocks
 //! - `call` requires `tokio` or `async-std` feature
 //! - `call_blocking` has no feature requirements
 use std::{boxed, future::Future, io, pin::Pin};
@@ -152,6 +151,7 @@ pub type Action<A> =
     Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
 
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
+#[doc(hidden)]
 pub fn into_actor_fut_res<'a, Fut, T, E>(fut: Fut) -> ActorFut<'a, Result<T,E>>
 where
     Fut: Future<Output = Result<T,E>> + Send + 'a,
@@ -161,6 +161,7 @@ where
 }
 
 /// Box a future yielding `T`, wrap as `Ok(T)`. Used by `act_ok!` macro.
+#[doc(hidden)]
 pub fn into_actor_fut_ok<'a, Fut, T, E>(fut: Fut) -> ActorFut<'a, Result<T, E>>
 where
     Fut: Future<Output = T> + Send + 'a,
@@ -168,17 +169,6 @@ where
     E: ActorError,
 {
     return Box::pin(async move { Ok(fut.await) });
-}
-
-/// Box a unit future, wrap as `Ok(())`.
-pub fn into_actor_fut_unit_ok<'a, Fut>(fut: Fut) -> ActorFut<'a, io::Result<()>>
-where
-    Fut: Future<Output = ()> + Send + 'a,
-{
-    Box::pin(async move {
-        fut.await;
-        Ok::<(), io::Error>(())
-    })
 }
 
 /// Create action returning `Result<T, E>`.
@@ -223,8 +213,12 @@ macro_rules! act_ok {
 ///         loop {
 ///             tokio::select! {
 ///                 Ok(action) = self.rx.recv_async() => action(self).await,
+///                 _ = tokio::signal::ctrl_c() => {
+///                     break;
+///                 }
 ///             }
 ///         }
+///         Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
 ///     }
 /// }
 /// ```
@@ -233,17 +227,16 @@ pub trait Actor<E>: Send + 'static {
     fn run(&mut self) -> impl Future<Output = Result<(),E>> + Send;
 }
 
-/// Blocking actor trait. Loop forever using `recv()` and `block_on()`.
+/// Blocking actor trait. Loop receiving actions with `recv()` and executing them with `block_on()`.
 ///
 /// # Example
 /// ```rust,ignore
 /// impl ActorSync<io::Error> for MyActor {
 ///     fn run_blocking(&mut self) -> io::Result<()> {
-///         loop {
-///             if let Ok(action) = self.rx.recv() {
-///                 block_on(action(self));
-///             }
+///         while let Ok(action) = self.rx.recv() {
+///             block_on(action(self));
 ///         }
+///         Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
 ///     }
 /// }
 /// ```
@@ -318,7 +311,7 @@ where
     A: Send + 'static,
     E: ActorError,
 {
-    /// Create handle and receiver. Unbounded channel to avoid deadlocks.
+    /// Create handle and receiver.
     ///
     /// # Example
     /// ```rust,ignore
@@ -401,24 +394,9 @@ where
         R: Send + 'static,
     {
         let (rrx, loc) = self.base_call(f)?;
-
-        // Poll for result with timeouts to avoid blocking forever
-        loop {
-            match rrx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(result) => return result,
-                Err(flume::RecvTimeoutError::Timeout) => {
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(flume::RecvTimeoutError::Disconnected) => {
-                    return Err(E::from_actor_message(format!(
-                        "actor stopped at {}:{}",
-                        loc.file(),
-                        loc.line()
-                    )));
-                }
-            }
-        }
+        rrx.recv().map_err(|_| {
+            E::from_actor_message(format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))
+        })?
     }
 
     /// Send action, await result. Requires `tokio` or `async-std` feature.
