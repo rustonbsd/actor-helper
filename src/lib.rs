@@ -362,7 +362,10 @@ macro_rules! act_ok {
 /// See also: [`ActorSync`] for synchronous/blocking actors.
 #[cfg(any(feature = "tokio", feature = "async-std"))]
 pub trait Actor: Send + 'static {
+    #[cfg(not(feature = "anyhow"))]
     fn run(&mut self) -> impl Future<Output = io::Result<()>> + Send;
+    #[cfg(feature = "anyhow")]
+    fn run(&mut self) -> impl Future<Output = anyhow::Result<()>> + Send;
 }
 
 /// Trait for synchronous actors that process actions in a blocking run loop.
@@ -391,7 +394,11 @@ pub trait Actor: Send + 'static {
 ///
 /// See also: [`Actor`] for async actors.
 pub trait ActorSync: Send + 'static {
+    #[cfg(not(feature = "anyhow"))]
     fn run_blocking(&mut self) -> io::Result<()>;
+
+    #[cfg(feature = "anyhow")]
+    fn run_blocking(&mut self) -> anyhow::Result<()>;
 }
 
 /// Spawn a synchronous actor on a new OS thread.
