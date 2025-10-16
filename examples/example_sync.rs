@@ -5,7 +5,7 @@ use actor_helper::{act, act_ok, block_on, spawn_actor_blocking, ActorSync, Handl
 
 // Public API
 pub struct Counter {
-    handle: Handle<CounterActor>,
+    handle: Handle<CounterActor, io::Error>,
 }
 
 impl Counter {
@@ -47,8 +47,8 @@ struct CounterActor {
     rx: Receiver<actor_helper::Action<CounterActor>>,
 }
 
-impl ActorSync for CounterActor {
-    fn run_blocking(&mut self) -> io::Result<()> {
+impl ActorSync<io::Error> for CounterActor {
+    fn run_blocking(&mut self) -> Result<(), io::Error> {
         loop {
             if let Ok(action) = self.rx.recv() {
                 block_on(action(self));

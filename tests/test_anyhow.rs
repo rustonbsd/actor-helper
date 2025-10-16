@@ -1,6 +1,7 @@
 #[cfg(test)]
-mod sync_tests {
-    use std::{io, sync::Arc};
+#[cfg(feature = "anyhow")]
+mod anyhow_tests {
+    use std::sync::Arc;
 
     use actor_helper::{block_on, spawn_actor_blocking, Action, ActorSync, Handle, Receiver};
     use actor_helper::{act, act_ok};
@@ -10,8 +11,8 @@ mod sync_tests {
         rx: Receiver<Action<TestActor>>,
     }
 
-    impl ActorSync<io::Error> for TestActor {
-        fn run_blocking(&mut self) -> Result<(), io::Error> {
+    impl ActorSync<anyhow::Error> for TestActor {
+        fn run_blocking(&mut self) -> Result<(), anyhow::Error> {
             loop {
                 if let Ok(action) = self.rx.recv() {
                     println!("Received an action");
@@ -22,7 +23,7 @@ mod sync_tests {
     }
 
     struct TestApi {
-        handle: Handle<TestActor,io::Error>,
+        handle: Handle<TestActor,anyhow::Error>,
     }
 
     impl TestApi {
@@ -35,32 +36,32 @@ mod sync_tests {
             Self { handle }
         }
 
-        fn set_value(&self, value: i32) -> io::Result<()> {
+        fn set_value(&self, value: i32) -> anyhow::Result<()> {
             self.handle
                 .call_blocking(act_ok!(actor => async move {
                     actor.value = value;
                 }))
         }
 
-        fn get_value(&self) -> io::Result<i32> {
+        fn get_value(&self) -> anyhow::Result<i32> {
             self.handle
                 .call_blocking(act_ok!(actor => async move {
                         actor.value
                 }))
         }
 
-        fn increment(&self, by: i32) -> io::Result<()> {
+        fn increment(&self, by: i32) -> anyhow::Result<()> {
             self.handle
                 .call_blocking(act_ok!(actor => async move {
                     actor.value += by;
                 }))
         }
 
-        fn set_positive(&self, value: i32) -> io::Result<()> {
+        fn set_positive(&self, value: i32) -> anyhow::Result<()> {
             self.handle
                 .call_blocking(act!(actor => async move {
                     if value <= 0 {
-                        Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+                        Err(anyhow::anyhow!("Value must be positive"))
                     } else {
                         actor.value = value;
                         Ok(())
@@ -68,7 +69,7 @@ mod sync_tests {
                 }))
         }
 
-        fn multiply(&self, factor: i32) -> io::Result<i32> {
+        fn multiply(&self, factor: i32) -> anyhow::Result<i32> {
             self.handle
                 .call_blocking(act_ok!(actor => async move {
                     actor.value *= factor;
@@ -159,8 +160,8 @@ mod sync_tests {
         rx: Receiver<Action<CounterActor>>,
     }
 
-    impl ActorSync<io::Error> for CounterActor {
-        fn run_blocking(&mut self) -> io::Result<()> {
+    impl ActorSync<anyhow::Error> for CounterActor {
+        fn run_blocking(&mut self) -> anyhow::Result<()> {
             while let Ok(action) = self.rx.recv() {
                 block_on(action(self));
             }
@@ -170,7 +171,7 @@ mod sync_tests {
 
     #[test]
     fn test_shared_state() {
-        let (handle, rx) = Handle::<CounterActor, io::Error>::channel();
+        let (handle, rx) = Handle::<CounterActor, anyhow::Error>::channel();
         let actor = CounterActor { count: 0, rx };
 
         
@@ -207,7 +208,7 @@ mod sync_tests {
     
     #[test]
     fn test_multiple_handles_same_actor() {
-        let (handle1, rx) = Handle::<TestActor, io::Error>::channel();
+        let (handle1, rx) = Handle::<TestActor, anyhow::Error>::channel();
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
 

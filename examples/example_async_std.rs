@@ -4,7 +4,7 @@ use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
 
 // Public API
 pub struct Counter {
-    handle: Handle<CounterActor>,
+    handle: Handle<CounterActor, io::Error>,
 }
 
 impl Counter {
@@ -46,7 +46,7 @@ struct CounterActor {
     rx: Receiver<actor_helper::Action<CounterActor>>,
 }
 
-impl Actor for CounterActor {
+impl Actor<io::Error> for CounterActor {
     async fn run(&mut self) -> io::Result<()> {
         loop {
             if let Ok(action) = self.rx.recv_async().await {

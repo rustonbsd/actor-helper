@@ -4,113 +4,86 @@
 [![Documentation](https://docs.rs/actor-helper/badge.svg)](https://docs.rs/actor-helper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A minimal, ergonomic actor runtime built on top of Tokio.
-
-
+Lightweight, runtime-agnostic actor pattern with dynamic error types.
 
 ## Features
 
-- **Simple API**: Create actors with just a handle and receiver
+- **Runtime agnostic**: Works with `tokio`, `async-std`, or blocking threads
+- **Dynamic errors**: Use `io::Error`, `anyhow::Error`, or custom error types
 - **Type-safe**: Compile-time guarantees for actor interactions
-- **Panic-safe**: Automatic panic capture and error propagation
-- **Ergonomic macros**: `act!` and `act_ok!` for writing actor actions
+- **Panic-safe**: Panics caught and converted to errors with location info
+- **Ergonomic**: `act!` and `act_ok!` macros for inline actions
 - **Thread-safe**: Clone handles to communicate from anywhere
 
 ## Direct Actor Access
 
-`actor-helper` provides **direct mutable access** to actor state through closures. Instead of defining message types and handlers, you write functions that directly manipulate the actor:
+Write closures that directly access actor state—no message types needed:
 
 ```rust
-// Traditional message passing approach:
-// actor.send(Increment(5)).await?;
-
-// actor-helper approach - direct function execution:
-handle.call(act_ok!(actor => async move { actor.value += 5; })).await?;
+// Direct function execution
+handle.call(act_ok!(actor => async move { 
+    actor.value += 5; 
+})).await?;
 ```
 
-This design offers several advantages:
-- **No message types**: Write functions directly instead of defining enums/structs
-- **Type safety**: Full compile-time checking of actor interactions
-- **Flexibility**: Execute any logic on the actor state, including async operations
-- **Simplicity**: Less boilerplate, more readable code
-
-The `Handle` is clonable and can be shared across threads, but all access to the actor's mutable state is serialized through the actor's mailbox, maintaining single-threaded safety.
-
-## Important: Keep Actions Fast
-
-**Actions passed to `handle.call()` should complete quickly.** The actor processes actions sequentially, so a slow action blocks the entire mailbox:
+**Keep actions fast.** Long operations block the mailbox:
 
 ```rust
-// DON'T: Long-running operations block the actor
+// ❌ DON'T: Blocks other actions
 handle.call(act!(actor => async move {
-    tokio::time::sleep(Duration::from_secs(10)).await; // Blocks other actions!
+    tokio::time::sleep(Duration::from_secs(10)).await;
     Ok(())
 })).await?;
 
-// DO: Spawn long-running work separately
+// ✅ DO: Spawn long work separately
 handle.call(act_ok!(actor => {
     let data = actor.get_work_data();
-    tokio::spawn(async move {
-        // Long operation runs independently
-        process_data(data).await;
-    });
+    tokio::spawn(async move { process_data(data).await });
 })).await?;
 ```
 
-For background work or continuous tasks, implement them in the actor's `run()` method using `tokio::select!`.
-
 ## Quick Start
-
-Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-actor-helper = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-anyhow = "1"
+actor-helper = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 ```
 
 ## Example
 
 ```rust
-use actor_helper::{Actor, Handle, act_ok, act};
-use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use std::io;
+use actor_helper::{Actor, Handle, Receiver, act_ok, act, spawn_actor};
 
 // Public API
 pub struct Counter {
-    handle: Handle<CounterActor>,
+    handle: Handle<CounterActor, io::Error>,
 }
 
 impl Counter {
     pub fn new() -> Self {
-        let (handle, rx) = Handle::channel(128);
-        let actor = CounterActor { value: 0, rx };
-        
-        tokio::spawn(async move {
-            let mut actor = actor;
-            let _ = actor.run().await;
-        });
-
+        let (handle, rx) = Handle::channel();
+        spawn_actor(CounterActor { value: 0, rx });
         Self { handle }
     }
 
-    pub async fn increment(&self, by: i32) -> Result<()> {
+    pub async fn increment(&self, by: i32) -> io::Result<()> {
         self.handle.call(act_ok!(actor => async move {
             actor.value += by;
         })).await
     }
 
-    pub async fn get(&self) -> Result<i32> {
+    pub async fn get(&self) -> io::Result<i32> {
         self.handle.call(act_ok!(actor => async move { 
             actor.value
         })).await
     }
 
-    pub async fn set_positive(&self, value: i32) -> Result<()> {
+    pub async fn set_positive(&self, value: i32) -> io::Result<()> {
         self.handle.call(act!(actor => async move {
             if value <= 0 {
-                Err(anyhow!("Value must be positive"))
+                Err(io::Error::new(io::ErrorKind::Other, "must be positive"))
             } else {
                 actor.value = value;
                 Ok(())
@@ -119,27 +92,24 @@ impl Counter {
     }
 }
 
-// Private actor implementation
+// Private actor
 struct CounterActor {
     value: i32,
-    rx: mpsc::Receiver<actor_helper::Action<CounterActor>>,
+    rx: Receiver<actor_helper::Action<CounterActor>>,
 }
 
-impl Actor for CounterActor {
-    async fn run(&mut self) -> Result<()> {
+impl Actor<io::Error> for CounterActor {
+    async fn run(&mut self) -> io::Result<()> {
         loop {
             tokio::select! {
-                Some(action) = self.rx.recv() => {
-                    action(self).await;
-                }
-                // Your background reader.recv() etc here!
+                Ok(action) = self.rx.recv_async() => action(self).await,
             }
         }
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> io::Result<()> {
     let counter = Counter::new();
     
     counter.increment(5).await?;
@@ -149,6 +119,30 @@ async fn main() -> Result<()> {
     println!("Value: {}", counter.get().await?);
     
     Ok(())
+}
+```
+
+## Using `anyhow::Error`
+
+Enable the feature and use `anyhow::Error` as your error type:
+
+```toml
+[dependencies]
+actor-helper = { version = "0.2", features = ["anyhow"] }
+```
+
+```rust
+use anyhow::{anyhow, Result};
+use actor_helper::{Actor, Handle, Receiver};
+
+pub struct Counter {
+    handle: Handle<CounterActor, anyhow::Error>,
+}
+
+impl Actor<anyhow::Error> for CounterActor {
+    async fn run(&mut self) -> Result<()> {
+        // ...
+    }
 }
 ```
 

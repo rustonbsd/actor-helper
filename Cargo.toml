@@ -62,3 +62,8 @@ required-features = ["tokio"]
 name = "test_async_std"
 path = "tests/test_async_std.rs"
 required-features = ["async-std"]
+
+[[test]]
+name = "test_anyhow"
+path = "tests/test_anyhow.rs"
+required-features = ["anyhow"]

@@ -13,7 +13,7 @@ struct TestActor {
     rx: Receiver<Action<TestActor>>,
 }
 
-impl Actor for TestActor {
+impl Actor<io::Error> for TestActor {
     async fn run(&mut self) -> io::Result<()> {
         loop {
             tokio::select! {
@@ -26,7 +26,7 @@ impl Actor for TestActor {
 }
 
 struct TestApi {
-    handle: Handle<TestActor>,
+    handle: Handle<TestActor, io::Error>,
 }
 
 impl TestApi {
@@ -158,7 +158,7 @@ struct CounterActor {
     rx: Receiver<Action<CounterActor>>,
 }
 
-impl Actor for CounterActor {
+impl Actor<io::Error> for CounterActor {
     async fn run(&mut self) -> io::Result<()> {
         loop {
             tokio::select! {
@@ -172,7 +172,7 @@ impl Actor for CounterActor {
 
 #[tokio::test]
 async fn test_shared_state() {
-    let (handle, rx) = Handle::channel();
+    let (handle, rx) = Handle::<CounterActor, io::Error>::channel();
     let actor = CounterActor { count: 0, rx };
 
     let _join_handle = spawn_actor(actor);
@@ -211,7 +211,7 @@ async fn test_async_action() {
 
 #[tokio::test]
 async fn test_multiple_handles_same_actor() {
-    let (handle1, rx) = Handle::channel();
+    let (handle1, rx) = Handle::<TestActor, io::Error>::channel();
     let handle2 = handle1.clone();
     let handle3 = handle1.clone();
 
