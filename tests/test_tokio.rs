@@ -6,7 +6,6 @@ use std::{io, sync::Arc};
 
 use actor_helper::{Action, Actor, Handle, Receiver, spawn_actor};
 use actor_helper::{act, act_ok};
-use tokio;
 
 struct TestActor {
     value: i32,
@@ -60,7 +59,7 @@ impl TestApi {
     async fn set_positive(&self, value: i32) -> io::Result<()> {
         self.handle.call(act!(actor => async move {
             if value <= 0 {
-                Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+                Err(io::Error::other("Value must be positive"))
             } else {
                 actor.value = value;
                 Ok(())
@@ -114,12 +113,10 @@ async fn test_return_values() {
 #[tokio::test]
 async fn test_concurrent_access() {
     let api = Arc::new(TestApi::new());
-    let mut handles = vec![];
-
+    
     for i in 0..10 {
         let api_clone = api.clone();
-        let handle = api_clone.increment(i).await.unwrap();
-        handles.push(handle);
+        api_clone.increment(i).await.unwrap();
     }
 
     let final_value = api.get_value().await.unwrap();

@@ -115,7 +115,7 @@ pub trait ActorError: Sized + Send + 'static {
 // Implementations for common types
 impl ActorError for io::Error {
     fn from_actor_message(msg: String) -> Self {
-        io::Error::new(io::ErrorKind::Other, msg)
+        io::Error::other(msg)
     }
 }
 
@@ -134,7 +134,7 @@ impl ActorError for String {
 
 impl ActorError for Box<dyn std::error::Error + Send + Sync> {
     fn from_actor_message(msg: String) -> Self {
-        Box::new(io::Error::new(io::ErrorKind::Other, msg))
+        Box::new(io::Error::other(msg))
     }
 }
 
@@ -149,6 +149,12 @@ pub type ActorFut<'a, T> = Pin<boxed::Box<PreBoxActorFut<'a, T>>>;
 /// Created via `act!` or `act_ok!` macros. Return values flow through oneshot channels.
 pub type Action<A> =
     Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
+
+/// Internal result type used by `Handle::base_call`.
+type BaseCallResult<R, E> = Result<(
+    Receiver<Result<R, E>>,
+    &'static std::panic::Location<'static>,
+), E>;
 
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
 #[doc(hidden)]
@@ -168,7 +174,7 @@ where
     T: Send + 'a,
     E: ActorError,
 {
-    return Box::pin(async move { Ok(fut.await) });
+    Box::pin(async move { Ok(fut.await) })
 }
 
 /// Create action returning `Result<T, E>`.
@@ -306,6 +312,23 @@ where
     }
 }
 
+impl<A, E> PartialEq for Handle<A, E>
+where
+    A: Send + 'static,
+    E: ActorError,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
+
+impl<A, E> Eq for Handle<A, E>
+where
+    A: Send + 'static,
+    E: ActorError,
+{
+}
+
 impl<A, E> Handle<A, E>
 where
     A: Send + 'static,
@@ -327,13 +350,7 @@ where
     fn base_call<R, F>(
         &self,
         f: F,
-    ) -> Result<
-        (
-            Receiver<Result<R, E>>,
-            &'static std::panic::Location<'static>,
-        ),
-        E,
-    >
+    ) -> BaseCallResult<R, E>
     where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
@@ -418,5 +435,23 @@ where
         rrx.recv_async().await.map_err(|_| {
             E::from_actor_message(format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))
         })?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Handle;
+
+    #[derive(Debug)]
+    struct TestActor;
+
+    #[test]
+    fn handle_equality_uses_channel_identity() {
+        let (h1, _rx1) = Handle::<TestActor, std::io::Error>::channel();
+        let h2 = h1.clone();
+        let (h3, _rx3) = Handle::<TestActor, std::io::Error>::channel();
+
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
     }
 }

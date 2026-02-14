@@ -116,12 +116,9 @@ mod anyhow_tests {
     #[test]
     fn test_concurrent_access() {
         let api = Arc::new(TestApi::new());
-        let mut handles = vec![];
-
         for i in 0..10 {
             let api_clone = api.clone();
-            let handle = api_clone.increment(i).unwrap();
-            handles.push(handle);
+            api_clone.increment(i).unwrap();
         }
 
         let final_value = api.get_value().unwrap();

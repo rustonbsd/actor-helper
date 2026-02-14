@@ -60,7 +60,7 @@ mod sync_tests {
             self.handle
                 .call_blocking(act!(actor => async move {
                     if value <= 0 {
-                        Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+                        Err(std::io::Error::other("Value must be positive"))
                     } else {
                         actor.value = value;
                         Ok(())
@@ -119,8 +119,8 @@ mod sync_tests {
 
         for i in 0..10 {
             let api_clone = api.clone();
-            let handle = api_clone.increment(i).unwrap();
-            handles.push(handle);
+            api_clone.increment(i).unwrap();
+            handles.push(api_clone);
         }
 
         let final_value = api.get_value().unwrap();

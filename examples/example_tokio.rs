@@ -1,4 +1,3 @@
-
 use std::io;
 
 use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
@@ -8,13 +7,17 @@ pub struct Counter {
     handle: Handle<CounterActor, io::Error>,
 }
 
+impl Default for Counter {
+    fn default() -> Self {
+        let (handle, rx) = Handle::channel();
+        let _join_handle = spawn_actor(CounterActor { value: 0, rx });
+        Self { handle }
+    }
+}
+
 impl Counter {
     pub fn new() -> Self {
-        let (handle, rx) = Handle::channel();
-
-        let _join_handle = spawn_actor(CounterActor { value: 0, rx });
-
-        Self { handle }
+        Self::default()
     }
 
     pub async fn increment(&self, by: i32) -> io::Result<()> {
@@ -37,7 +40,7 @@ impl Counter {
         self.handle
             .call(act!(actor => async move {
                 if value <= 0 {
-                    Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+                    Err(io::Error::other("Value must be positive"))
                 } else {
                     actor.value = value;
                     Ok(())
@@ -66,7 +69,7 @@ impl Actor<io::Error> for CounterActor {
                 }
             }
         }
-        Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
+        Err(io::Error::other("Actor stopped"))
     }
 }
 

@@ -1,20 +1,23 @@
-
 use std::io;
 
-use actor_helper::{act, act_ok, block_on, spawn_actor_blocking, ActorSync, Handle, Receiver};
+use actor_helper::{ActorSync, Handle, Receiver, act, act_ok, block_on, spawn_actor_blocking};
 
 // Public API
 pub struct Counter {
     handle: Handle<CounterActor, io::Error>,
 }
 
+impl Default for Counter {
+    fn default() -> Self {
+        let (handle, rx) = Handle::channel();
+        let _join_handle = spawn_actor_blocking(CounterActor { value: 0, rx });
+        Self { handle }
+    }
+}
+
 impl Counter {
     pub fn new() -> Self {
-        let (handle, rx) = Handle::channel();
-
-        let _join_handle = spawn_actor_blocking(CounterActor { value: 0, rx });
-
-        Self { handle }
+        Self::default()
     }
 
     pub fn increment(&self, by: i32) -> io::Result<()> {
@@ -32,7 +35,7 @@ impl Counter {
     pub fn set_positive(&self, value: i32) -> io::Result<()> {
         self.handle.call_blocking(act!(actor => async move {
             if value <= 0 {
-                Err(io::Error::new(io::ErrorKind::Other, "Value must be positive"))
+                Err(io::Error::other("Value must be positive"))
             } else {
                 actor.value = value;
                 Ok(())
