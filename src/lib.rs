@@ -159,6 +159,12 @@ type BaseCallResult<R, E> = Result<
     E,
 >;
 
+/// Internal result type used by `Handle::base_call`.
+type BaseCallResult<R, E> = Result<(
+    Receiver<Result<R, E>>,
+    &'static std::panic::Location<'static>,
+), E>;
+
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
 #[doc(hidden)]
 pub fn into_actor_fut_res<'a, Fut, T, E>(fut: Fut) -> ActorFut<'a, Result<T, E>>
