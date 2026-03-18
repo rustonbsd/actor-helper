@@ -224,4 +224,20 @@ mod anyhow_tests {
 
         assert_eq!(result, 20);
     }
+
+    struct PanicActor;
+
+    impl ActorSync<anyhow::Error> for PanicActor {
+        fn run_blocking(&mut self) -> Result<(), anyhow::Error> {
+            panic!("blocking actor panic");
+        }
+    }
+
+    #[test]
+    fn test_actor_loop_panic_is_returned_as_error() {
+        let result = spawn_actor_blocking(PanicActor).join().unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("panic in actor loop"));
+        assert!(error.contains("blocking actor panic"));
+    }
 }
