@@ -160,10 +160,13 @@ type BaseCallResult<R, E> = Result<
 >;
 
 /// Internal result type used by `Handle::base_call`.
-type BaseCallResult<R, E> = Result<(
-    Receiver<Result<R, E>>,
-    &'static std::panic::Location<'static>,
-), E>;
+type BaseCallResult<R, E> = Result<
+    (
+        Receiver<Result<R, E>>,
+        &'static std::panic::Location<'static>,
+    ),
+    E,
+>;
 
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
 #[doc(hidden)]
