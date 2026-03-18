@@ -15,10 +15,10 @@ struct TestActor {
 impl Actor<io::Error> for TestActor {
     async fn run(&mut self) -> io::Result<()> {
         loop {
-            tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
-                    action(self).await;
-                }
+            if let Ok(action) = self.rx.recv_async().await {
+                action(self).await;
+            } else {
+                break;
             }
         }
     }
@@ -231,6 +231,37 @@ async fn test_multiple_handles_same_actor() {
         .unwrap();
 
     assert_eq!(result, 20);
+}
+
+struct PanicOnDisconnectActor {
+    rx: Receiver<Action<PanicOnDisconnectActor>>,
+}
+
+impl Actor<io::Error> for PanicOnDisconnectActor {
+    async fn run(&mut self) -> io::Result<()> {
+        loop {
+            tokio::select! {
+                Ok(action) = self.rx.recv_async() => {
+                    action(self).await;
+                }
+            }
+        }
+    }
+}
+
+#[async_std::test]
+async fn test_actor_loop_panic_is_returned_as_error() {
+    let join_handle = {
+        let (handle, rx) = Handle::<PanicOnDisconnectActor, io::Error>::channel();
+        let join_handle = spawn_actor(PanicOnDisconnectActor { rx });
+        drop(handle);
+        join_handle
+    };
+
+    let result = join_handle.await;
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("panic in actor loop"));
+    assert!(error.contains("all branches are disabled"));
 }
 
 }

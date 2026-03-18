@@ -63,10 +63,7 @@ impl Actor<io::Error> for CounterActor {
                 Ok(action) = self.rx.recv_async() => {
                     action(self).await;
                 },
-                _ = tokio::signal::ctrl_c() => {
-                    println!("Received Ctrl+C, shutting down.");
-                    break;
-                }
+                else => break,
             }
         }
         Err(io::Error::other("Actor stopped"))

@@ -42,6 +42,7 @@
 //!         loop {
 //!             tokio::select! {
 //!                 Ok(action) = self.rx.recv_async() => action(self).await,
+//!                 else => break Ok(()),
 //!             }
 //!         }
 //!     }
@@ -81,7 +82,7 @@
 //! - Panics are caught and converted to errors with location info
 //! - `call` requires `tokio` or `async-std` feature
 //! - `call_blocking` has no feature requirements
-use std::{boxed, future::Future, io, pin::Pin};
+use std::{any::Any, boxed, future::Future, io, pin::Pin};
 
 use futures_util::FutureExt;
 
@@ -147,20 +148,22 @@ pub type ActorFut<'a, T> = Pin<boxed::Box<PreBoxActorFut<'a, T>>>;
 /// Action sent to an actor: `FnOnce(&mut A) -> Future<()>`.
 ///
 /// Created via `act!` or `act_ok!` macros. Return values flow through oneshot channels.
-pub type Action<A> =
-    Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
+pub type Action<A> = Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Send + 'static>;
 
 /// Internal result type used by `Handle::base_call`.
-type BaseCallResult<R, E> = Result<(
-    Receiver<Result<R, E>>,
-    &'static std::panic::Location<'static>,
-), E>;
+type BaseCallResult<R, E> = Result<
+    (
+        Receiver<Result<R, E>>,
+        &'static std::panic::Location<'static>,
+    ),
+    E,
+>;
 
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
 #[doc(hidden)]
-pub fn into_actor_fut_res<'a, Fut, T, E>(fut: Fut) -> ActorFut<'a, Result<T,E>>
+pub fn into_actor_fut_res<'a, Fut, T, E>(fut: Fut) -> ActorFut<'a, Result<T, E>>
 where
-    Fut: Future<Output = Result<T,E>> + Send + 'a,
+    Fut: Future<Output = Result<T, E>> + Send + 'a,
     T: Send + 'a,
 {
     Box::pin(fut)
@@ -219,9 +222,7 @@ macro_rules! act_ok {
 ///         loop {
 ///             tokio::select! {
 ///                 Ok(action) = self.rx.recv_async() => action(self).await,
-///                 _ = tokio::signal::ctrl_c() => {
-///                     break;
-///                 }
+///                 else => break Ok(()),
 ///             }
 ///         }
 ///         Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
@@ -230,7 +231,7 @@ macro_rules! act_ok {
 /// ```
 #[cfg(any(feature = "tokio", feature = "async-std"))]
 pub trait Actor<E>: Send + 'static {
-    fn run(&mut self) -> impl Future<Output = Result<(),E>> + Send;
+    fn run(&mut self) -> impl Future<Output = Result<(), E>> + Send;
 }
 
 /// Blocking actor trait. Loop receiving actions with `recv()` and executing them with `block_on()`.
@@ -250,6 +251,23 @@ pub trait ActorSync<E>: Send + 'static {
     fn run_blocking(&mut self) -> Result<(), E>;
 }
 
+fn panic_payload_message(panic_payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = panic_payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn actor_loop_panic<E: ActorError>(panic_payload: Box<dyn Any + Send>) -> E {
+    E::from_actor_message(format!(
+        "panic in actor loop: {}",
+        panic_payload_message(panic_payload)
+    ))
+}
+
 /// Spawn blocking actor on new thread.
 pub fn spawn_actor_blocking<A, E>(actor: A) -> std::thread::JoinHandle<Result<(), E>>
 where
@@ -258,7 +276,10 @@ where
 {
     std::thread::spawn(move || {
         let mut actor = actor;
-        actor.run_blocking()
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.run_blocking())) {
+            Ok(result) => result,
+            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+        }
     })
 }
 
@@ -271,7 +292,13 @@ where
 {
     tokio::task::spawn(async move {
         let mut actor = actor;
-        actor.run().await
+        match std::panic::AssertUnwindSafe(async move { actor.run().await })
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+        }
     })
 }
 
@@ -284,7 +311,13 @@ where
 {
     async_std::task::spawn(async move {
         let mut actor = actor;
-        actor.run().await
+        match std::panic::AssertUnwindSafe(async move { actor.run().await })
+            .catch_unwind()
+            .await
+        {
+            Ok(result) => result,
+            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+        }
     })
 }
 
@@ -292,18 +325,20 @@ where
 ///
 /// Thread-safe. Actions run sequentially on the actor.
 #[derive(Debug)]
-pub struct Handle<A, E> 
+pub struct Handle<A, E>
 where
     A: Send + 'static,
-    E: ActorError,{
+    E: ActorError,
+{
     tx: Sender<Action<A>>,
     _phantom: std::marker::PhantomData<E>,
 }
 
-impl<A, E> Clone for Handle<A, E> 
+impl<A, E> Clone for Handle<A, E>
 where
     A: Send + 'static,
-    E: ActorError,{
+    E: ActorError,
+{
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -343,14 +378,17 @@ where
     /// ```
     pub fn channel() -> (Self, Receiver<Action<A>>) {
         let (tx, rx) = flume::unbounded::<Action<A>>();
-        (Self { tx, _phantom: std::marker::PhantomData }, rx)
+        (
+            Self {
+                tx,
+                _phantom: std::marker::PhantomData,
+            },
+            rx,
+        )
     }
 
     /// Internal: wraps action with panic catching and result forwarding.
-    fn base_call<R, F>(
-        &self,
-        f: F,
-    ) -> BaseCallResult<R, E>
+    fn base_call<R, F>(&self, f: F) -> BaseCallResult<R, E>
     where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
@@ -391,7 +429,11 @@ where
                 })
             }))
             .map_err(|_| {
-                E::from_actor_message(format!("actor stopped (call send at {}:{})", loc.file(), loc.line()))
+                E::from_actor_message(format!(
+                    "actor stopped (call send at {}:{})",
+                    loc.file(),
+                    loc.line()
+                ))
             })?;
         Ok((rrx, loc))
     }
@@ -412,7 +454,11 @@ where
     {
         let (rrx, loc) = self.base_call(f)?;
         rrx.recv().map_err(|_| {
-            E::from_actor_message(format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))
+            E::from_actor_message(format!(
+                "actor stopped (call recv at {}:{})",
+                loc.file(),
+                loc.line()
+            ))
         })?
     }
 
@@ -433,7 +479,11 @@ where
     {
         let (rrx, loc) = self.base_call(f)?;
         rrx.recv_async().await.map_err(|_| {
-            E::from_actor_message(format!("actor stopped (call recv at {}:{})", loc.file(), loc.line()))
+            E::from_actor_message(format!(
+                "actor stopped (call recv at {}:{})",
+                loc.file(),
+                loc.line()
+            ))
         })?
     }
 }
