@@ -1,79 +1,83 @@
 #[cfg(test)]
 mod sync_tests {
+    use core::panic;
     use std::{io, sync::Arc};
 
-    use actor_helper::{block_on, spawn_actor_blocking, Action, ActorSync, Handle, Receiver};
+    use actor_helper::{Action, ActorSync, Handle, Receiver, block_on};
     use actor_helper::{act, act_ok};
 
     struct TestActor {
         value: i32,
+        should_stop: bool,
         rx: Receiver<Action<TestActor>>,
     }
 
     impl ActorSync<io::Error> for TestActor {
         fn run_blocking(&mut self) -> Result<(), io::Error> {
-            loop {
+            while !self.should_stop {
                 if let Ok(action) = self.rx.recv() {
-                    println!("Received an action");
                     block_on(action(self));
                 }
             }
+            Ok(())
         }
     }
 
     struct TestApi {
-        handle: Handle<TestActor,io::Error>,
+        handle: Handle<TestActor, io::Error>,
     }
 
     impl TestApi {
         fn new() -> Self {
-            let (handle, rx) = Handle::channel();
-            let actor = TestActor { value: 0, rx };
-            
-            let _join_handle = spawn_actor_blocking(actor);
+            Self {
+                handle: Handle::spawn_blocking(|rx| TestActor { value: 0, should_stop: false, rx }).0,
+            }
+        }
 
-            Self { handle }
+        fn stop_actor(&self) -> io::Result<()> {
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.should_stop = true;
+            }))
         }
 
         fn set_value(&self, value: i32) -> io::Result<()> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value = value;
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value = value;
+            }))
         }
 
         fn get_value(&self) -> io::Result<i32> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                        actor.value
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                    actor.value
+            }))
         }
 
         fn increment(&self, by: i32) -> io::Result<()> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value += by;
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value += by;
+            }))
         }
 
         fn set_positive(&self, value: i32) -> io::Result<()> {
-            self.handle
-                .call_blocking(act!(actor => async move {
-                    if value <= 0 {
-                        Err(std::io::Error::other("Value must be positive"))
-                    } else {
-                        actor.value = value;
-                        Ok(())
-                    }
-                }))
+            self.handle.call_blocking(act!(actor => async move {
+                if value <= 0 {
+                    Err(std::io::Error::other("Value must be positive"))
+                } else {
+                    actor.value = value;
+                    Ok(())
+                }
+            }))
         }
 
         fn multiply(&self, factor: i32) -> io::Result<i32> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value *= factor;
-                    actor.value
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value *= factor;
+                actor.value
+            }))
+        }
+
+        fn is_running(&self) -> bool {
+            self.handle.state() == actor_helper::ActorState::Running
         }
     }
 
@@ -125,8 +129,8 @@ mod sync_tests {
 
         let final_value = api.get_value().unwrap();
         assert_eq!(final_value, 45);
-    }    
-    
+    }
+
     #[test]
     fn test_sequential_operations() {
         let api = TestApi::new();
@@ -154,6 +158,16 @@ mod sync_tests {
         assert_eq!(api1.get_value().unwrap(), 150);
     }
 
+    #[test]
+    fn test_actor_lifecycle() {
+        let api = TestApi::new();
+        assert!(api.is_running());
+
+        api.stop_actor().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!api.is_running());
+    }
+
     struct CounterActor {
         count: i32,
         rx: Receiver<Action<CounterActor>>,
@@ -170,11 +184,8 @@ mod sync_tests {
 
     #[test]
     fn test_shared_state() {
-        let (handle, rx) = Handle::<CounterActor, io::Error>::channel();
-        let actor = CounterActor { count: 0, rx };
-
-        
-        let _join_handle = spawn_actor_blocking(actor);
+        let (handle, _) =
+            Handle::<CounterActor, io::Error>::spawn_blocking(|rx| CounterActor { count: 0, rx });
 
         handle
             .call_blocking(act_ok!(actor => async move {
@@ -204,15 +215,11 @@ mod sync_tests {
         assert_eq!(api.get_value().unwrap(), 999);
     }
 
-    
     #[test]
     fn test_multiple_handles_same_actor() {
-        let (handle1, rx) = Handle::<TestActor, io::Error>::channel();
+        let (handle1, _) = Handle::<TestActor, io::Error>::spawn_blocking(|rx| TestActor { value: 0, should_stop: false, rx });
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
-
-        let actor = TestActor { value: 0, rx };
-        let _join_handle = spawn_actor_blocking(actor);
 
         handle1
             .call_blocking(act_ok!(actor => async move { actor.value += 10; }))
@@ -227,17 +234,21 @@ mod sync_tests {
         assert_eq!(result, 20);
     }
 
-    struct PanicActor;
+    struct PanicActor {
+        _rx: Receiver<Action<PanicActor>>,
+    }
 
     impl ActorSync<io::Error> for PanicActor {
-        fn run_blocking(&mut self) -> Result<(), io::Error> {
+        fn run_blocking(&mut self) -> io::Result<()> {
             panic!("blocking actor panic");
         }
     }
 
     #[test]
     fn test_actor_loop_panic_is_returned_as_error() {
-        let result = spawn_actor_blocking(PanicActor).join().unwrap();
+        let (handle, join_handle) = Handle::<PanicActor, io::Error>::spawn_blocking(|rx| PanicActor { _rx: rx });
+        drop(handle);
+        let result = join_handle.join().unwrap();
         let error = result.unwrap_err().to_string();
         assert!(error.contains("panic in actor loop"));
         assert!(error.contains("blocking actor panic"));

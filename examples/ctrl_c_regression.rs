@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{Action, Actor, Handle, Receiver, spawn_actor};
+use actor_helper::{Action, Actor, Handle, Receiver};
 
 struct FragileActor {
     rx: Receiver<Action<FragileActor>>,
@@ -21,8 +21,7 @@ impl Actor<io::Error> for FragileActor {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let (handle, rx) = Handle::<FragileActor, io::Error>::channel();
-    let join_handle = spawn_actor(FragileActor { rx });
+    let (handle, join_handle) = Handle::<FragileActor, io::Error>::spawn(|rx| FragileActor { rx });
 
     println!("Press Ctrl+C to drop the last handle and shut the actor down.");
 
