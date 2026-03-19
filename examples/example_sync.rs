@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{ActorSync, Handle, Receiver, act, act_ok, block_on, spawn_actor_blocking};
+use actor_helper::{ActorSync, Handle, Receiver, act, act_ok, block_on};
 
 // Public API
 pub struct Counter {
@@ -9,9 +9,9 @@ pub struct Counter {
 
 impl Default for Counter {
     fn default() -> Self {
-        let (handle, rx) = Handle::channel();
-        let _join_handle = spawn_actor_blocking(CounterActor { value: 0, rx });
-        Self { handle }
+        Self {
+            handle: Handle::spawn_blocking(|rx| CounterActor { value: 0, rx }).0,
+        }
     }
 }
 

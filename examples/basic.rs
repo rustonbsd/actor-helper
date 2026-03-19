@@ -1,4 +1,4 @@
-use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
+use actor_helper::{Actor, ActorState, Handle, Receiver, act, act_ok};
 use anyhow::{Result, anyhow};
 
 // Public API
@@ -8,10 +8,9 @@ pub struct Counter {
 
 impl Default for Counter {
     fn default() -> Self {
-        let (handle, rx) = Handle::channel();
-        let _join_handle = spawn_actor(CounterActor { value: 0, rx });
-
-        Self { handle }
+        Self {
+            handle: Handle::spawn(|rx| CounterActor { value: 0, rx }).0,
+        }
     }
 }
 
@@ -48,6 +47,10 @@ impl Counter {
             }))
             .await
     }
+
+    pub async fn is_running(&self) -> bool {
+        self.handle.state() == ActorState::Running
+    }
 }
 
 // Private actor implementation
@@ -75,6 +78,8 @@ async fn main() -> Result<()> {
 
     counter.set_positive(10).await?;
     println!("Value: {}", counter.get().await?);
+
+    println!("Is running: {}", counter.is_running().await);
 
     Ok(())
 }
