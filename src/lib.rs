@@ -27,7 +27,7 @@
 //!     pub async fn get(&self) -> io::Result<i32> {
 //!         self.handle.call(act_ok!(actor => async move { actor.value })).await
 //!     }
-//! 
+//!
 //!     pub async fn is_running(&self) -> bool {
 //!         self.handle.state() == ActorState::Running
 //!     }
@@ -87,13 +87,21 @@
 use std::{
     any::Any,
     boxed,
+    collections::HashMap,
     future::Future,
     io,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use futures_util::FutureExt;
+use futures_util::{
+    FutureExt,
+    future::{self, Either},
+    pin_mut,
+};
 
 /// Flume unbounded sender.
 pub type Sender<T> = flume::Sender<T>;
@@ -171,10 +179,22 @@ pub type Action<A> = Box<dyn for<'a> FnOnce(&'a mut A) -> ActorFut<'a, ()> + Sen
 type BaseCallResult<R, E> = Result<
     (
         Receiver<Result<R, E>>,
+        Receiver<()>,
+        u64,
         &'static std::panic::Location<'static>,
     ),
     E,
 >;
+
+type PendingCancelMap = Arc<Mutex<HashMap<u64, Sender<()>>>>;
+
+fn fail_pending_calls(pending: &PendingCancelMap) {
+    if let Ok(mut pending) = pending.lock() {
+        for (_, cancel_tx) in pending.drain() {
+            let _ = cancel_tx.send(());
+        }
+    }
+}
 
 /// Box a future yielding `Result<T, E>`. Used by `act!` macro.
 #[doc(hidden)]
@@ -290,6 +310,7 @@ fn actor_loop_panic<E: ActorError>(panic_payload: Box<dyn Any + Send>) -> E {
 pub fn spawn_actor_blocking<A, E>(
     actor: A,
     state: Arc<RwLock<ActorState>>,
+    pending: PendingCancelMap,
 ) -> std::thread::JoinHandle<Result<(), E>>
 where
     A: ActorSync<E>,
@@ -303,6 +324,7 @@ where
         if let Ok(mut st) = state.write() {
             *st = ActorState::Stopped;
         }
+        fail_pending_calls(&pending);
 
         match res {
             Ok(result) => result,
@@ -317,6 +339,7 @@ where
 pub fn spawn_actor<A, E>(
     actor: A,
     state: Arc<RwLock<ActorState>>,
+    pending: PendingCancelMap,
 ) -> tokio::task::JoinHandle<Result<(), E>>
 where
     A: Actor<E>,
@@ -324,7 +347,7 @@ where
 {
     tokio::task::spawn(async move {
         let mut actor = actor;
-        
+
         let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
             .catch_unwind()
             .await;
@@ -332,6 +355,7 @@ where
         if let Ok(mut st) = state.write() {
             *st = ActorState::Stopped;
         }
+        fail_pending_calls(&pending);
         match res {
             Ok(result) => result,
             Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
@@ -345,6 +369,7 @@ where
 pub fn spawn_actor<A, E>(
     actor: A,
     state: Arc<RwLock<ActorState>>,
+    pending: PendingCancelMap,
 ) -> async_std::task::JoinHandle<Result<(), E>>
 where
     A: Actor<E>,
@@ -352,13 +377,14 @@ where
 {
     async_std::task::spawn(async move {
         let mut actor = actor;
-        
+
         let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
             .catch_unwind()
             .await;
         if let Ok(mut st) = state.write() {
             *st = ActorState::Stopped;
         }
+        fail_pending_calls(&pending);
         match res {
             Ok(result) => result,
             Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
@@ -377,6 +403,8 @@ where
 {
     tx: Sender<Action<A>>,
     state: Arc<RwLock<ActorState>>,
+    pending: PendingCancelMap,
+    next_call_id: Arc<AtomicU64>,
     _phantom: std::marker::PhantomData<E>,
 }
 
@@ -389,6 +417,8 @@ where
         Self {
             tx: self.tx.clone(),
             state: Arc::clone(&self.state),
+            pending: Arc::clone(&self.pending),
+            next_call_id: Arc::clone(&self.next_call_id),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -430,6 +460,8 @@ where
             Self {
                 tx,
                 state: Arc::new(RwLock::new(ActorState::default())),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                next_call_id: Arc::new(AtomicU64::new(0)),
                 _phantom: std::marker::PhantomData,
             },
             rx,
@@ -450,14 +482,18 @@ where
     {
         let (tx, rx) = flume::unbounded();
         let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
 
         let actor = create_actor(rx);
-        let join_handle = spawn_actor(actor, Arc::clone(&state));
+        let join_handle = spawn_actor(actor, Arc::clone(&state), Arc::clone(&pending));
 
         (
             Self {
                 tx,
                 state,
+                pending,
+                next_call_id,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
@@ -472,14 +508,18 @@ where
     {
         let (tx, rx) = flume::unbounded();
         let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
 
         let actor = create_actor(rx);
-        let join_handle = spawn_actor(actor, Arc::clone(&state));
+        let join_handle = spawn_actor(actor, Arc::clone(&state), Arc::clone(&pending));
 
         (
             Self {
                 tx,
                 state,
+                pending,
+                next_call_id,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
@@ -494,14 +534,18 @@ where
     {
         let (tx, rx) = flume::unbounded();
         let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
 
         let actor = create_actor(rx);
-        let join_handle = spawn_actor_blocking(actor, Arc::clone(&state));
+        let join_handle = spawn_actor_blocking(actor, Arc::clone(&state), Arc::clone(&pending));
 
         (
             Self {
                 tx,
                 state,
+                pending,
+                next_call_id,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
@@ -521,7 +565,13 @@ where
         }
 
         let (rtx, rrx) = flume::unbounded();
+        let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
         let loc = std::panic::Location::caller();
+        let call_id = self.next_call_id.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .expect("poisoned lock")
+            .insert(call_id, cancel_tx);
 
         self.tx
             .send(Box::new(move |actor: &mut A| {
@@ -556,13 +606,16 @@ where
                 })
             }))
             .map_err(|_| {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&call_id);
+                }
                 E::from_actor_message(format!(
                     "actor stopped (call send at {}:{})",
                     loc.file(),
                     loc.line()
                 ))
             })?;
-        Ok((rrx, loc))
+        Ok((rrx, cancel_rx, call_id, loc))
     }
 
     /// Send action, block until complete. Works without async runtime.
@@ -579,14 +632,41 @@ where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
     {
-        let (rrx, loc) = self.base_call(f)?;
-        rrx.recv().map_err(|_| {
-            E::from_actor_message(format!(
+        enum BlockingWaitResult<T, E> {
+            Result(Result<Result<T, E>, flume::RecvError>),
+            Canceled(Result<(), flume::RecvError>),
+        }
+
+        let (rrx, cancel_rx, call_id, loc) = self.base_call(f)?;
+        let out = match flume::Selector::new()
+            .recv(&rrx, BlockingWaitResult::Result)
+            .recv(&cancel_rx, BlockingWaitResult::Canceled)
+            .wait()
+        {
+            BlockingWaitResult::Result(msg) => msg.map_err(|_| {
+                E::from_actor_message(format!(
+                    "actor stopped (call recv at {}:{})",
+                    loc.file(),
+                    loc.line()
+                ))
+            })?,
+            BlockingWaitResult::Canceled(Ok(())) => Err(E::from_actor_message(format!(
+                "actor stopped (call canceled at {}:{})",
+                loc.file(),
+                loc.line()
+            ))),
+            BlockingWaitResult::Canceled(Err(_)) => Err(E::from_actor_message(format!(
                 "actor stopped (call recv at {}:{})",
                 loc.file(),
                 loc.line()
-            ))
-        })?
+            ))),
+        };
+
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&call_id);
+        }
+
+        out
     }
 
     /// Send action, await result. Requires `tokio` or `async-std` feature.
@@ -604,14 +684,37 @@ where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
     {
-        let (rrx, loc) = self.base_call(f)?;
-        rrx.recv_async().await.map_err(|_| {
-            E::from_actor_message(format!(
+        let (rrx, cancel_rx, call_id, loc) = self.base_call(f)?;
+
+        let recv_fut = rrx.recv_async();
+        let cancel_fut = cancel_rx.recv_async();
+        pin_mut!(recv_fut, cancel_fut);
+
+        let out = match future::select(recv_fut, cancel_fut).await {
+            Either::Left((msg, _)) => msg.map_err(|_| {
+                E::from_actor_message(format!(
+                    "actor stopped (call recv at {}:{})",
+                    loc.file(),
+                    loc.line()
+                ))
+            })?,
+            Either::Right((Ok(_), _)) => Err(E::from_actor_message(format!(
+                "actor stopped (call canceled at {}:{})",
+                loc.file(),
+                loc.line()
+            ))),
+            Either::Right((Err(_), _)) => Err(E::from_actor_message(format!(
                 "actor stopped (call recv at {}:{})",
                 loc.file(),
                 loc.line()
-            ))
-        })?
+            ))),
+        };
+
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&call_id);
+        }
+
+        out
     }
 }
 
