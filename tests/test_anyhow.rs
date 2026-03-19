@@ -3,7 +3,7 @@
 mod anyhow_tests {
     use std::sync::Arc;
 
-    use actor_helper::{block_on, spawn_actor_blocking, Action, ActorSync, Handle, Receiver};
+    use actor_helper::{Action, ActorSync, Handle, Receiver, block_on};
     use actor_helper::{act, act_ok};
 
     struct TestActor {
@@ -23,58 +23,50 @@ mod anyhow_tests {
     }
 
     struct TestApi {
-        handle: Handle<TestActor,anyhow::Error>,
+        handle: Handle<TestActor, anyhow::Error>,
     }
 
     impl TestApi {
         fn new() -> Self {
-            let (handle, rx) = Handle::channel();
-            let actor = TestActor { value: 0, rx };
-            
-            let _join_handle = spawn_actor_blocking(actor);
-
-            Self { handle }
+            Self {
+                handle: Handle::spawn_blocking(|rx| TestActor { value: 0, rx }).0,
+            }
         }
 
         fn set_value(&self, value: i32) -> anyhow::Result<()> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value = value;
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value = value;
+            }))
         }
 
         fn get_value(&self) -> anyhow::Result<i32> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                        actor.value
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                    actor.value
+            }))
         }
 
         fn increment(&self, by: i32) -> anyhow::Result<()> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value += by;
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value += by;
+            }))
         }
 
         fn set_positive(&self, value: i32) -> anyhow::Result<()> {
-            self.handle
-                .call_blocking(act!(actor => async move {
-                    if value <= 0 {
-                        Err(anyhow::anyhow!("Value must be positive"))
-                    } else {
-                        actor.value = value;
-                        Ok(())
-                    }
-                }))
+            self.handle.call_blocking(act!(actor => async move {
+                if value <= 0 {
+                    Err(anyhow::anyhow!("Value must be positive"))
+                } else {
+                    actor.value = value;
+                    Ok(())
+                }
+            }))
         }
 
         fn multiply(&self, factor: i32) -> anyhow::Result<i32> {
-            self.handle
-                .call_blocking(act_ok!(actor => async move {
-                    actor.value *= factor;
-                    actor.value
-                }))
+            self.handle.call_blocking(act_ok!(actor => async move {
+                actor.value *= factor;
+                actor.value
+            }))
         }
     }
 
@@ -123,8 +115,8 @@ mod anyhow_tests {
 
         let final_value = api.get_value().unwrap();
         assert_eq!(final_value, 45);
-    }    
-    
+    }
+
     #[test]
     fn test_sequential_operations() {
         let api = TestApi::new();
@@ -168,11 +160,9 @@ mod anyhow_tests {
 
     #[test]
     fn test_shared_state() {
-        let (handle, rx) = Handle::<CounterActor, anyhow::Error>::channel();
-        let actor = CounterActor { count: 0, rx };
-
-        
-        let _join_handle = spawn_actor_blocking(actor);
+        let (handle, _) = Handle::<CounterActor, anyhow::Error>::spawn_blocking(|rx| {
+            CounterActor { count: 0, rx }
+        });
 
         handle
             .call_blocking(act_ok!(actor => async move {
@@ -202,15 +192,12 @@ mod anyhow_tests {
         assert_eq!(api.get_value().unwrap(), 999);
     }
 
-    
     #[test]
     fn test_multiple_handles_same_actor() {
-        let (handle1, rx) = Handle::<TestActor, anyhow::Error>::channel();
+        let (handle1, _) =
+            Handle::<TestActor, anyhow::Error>::spawn_blocking(|rx| TestActor { value: 0, rx });
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
-
-        let actor = TestActor { value: 0, rx };
-        let _join_handle = spawn_actor_blocking(actor);
 
         handle1
             .call_blocking(act_ok!(actor => async move { actor.value += 10; }))
@@ -235,7 +222,10 @@ mod anyhow_tests {
 
     #[test]
     fn test_actor_loop_panic_is_returned_as_error() {
-        let result = spawn_actor_blocking(PanicActor).join().unwrap();
+        let (_handle, join_handle) =
+            Handle::<PanicActor, anyhow::Error>::spawn_blocking(|_| PanicActor);
+        let result = join_handle.join().unwrap();
+
         let error = result.unwrap_err().to_string();
         assert!(error.contains("panic in actor loop"));
         assert!(error.contains("blocking actor panic"));

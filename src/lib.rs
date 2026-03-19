@@ -15,9 +15,7 @@
 //!
 //! impl Counter {
 //!     pub fn new() -> Self {
-//!         let (handle, rx) = Handle::channel();
-//!         spawn_actor(CounterActor { value: 0, rx });
-//!         Self { handle }
+//!         Self { handle: Handle::spawn(|rx| CounterActor { value: 0, rx }) }
 //!     }
 //!
 //!     pub async fn increment(&self, by: i32) -> io::Result<()> {
@@ -28,6 +26,10 @@
 //!
 //!     pub async fn get(&self) -> io::Result<i32> {
 //!         self.handle.call(act_ok!(actor => async move { actor.value })).await
+//!     }
+//! 
+//!     pub async fn is_running(&self) -> bool {
+//!         self.handle.state() == ActorState::Running
 //!     }
 //! }
 //!
@@ -82,7 +84,14 @@
 //! - Panics are caught and converted to errors with location info
 //! - `call` requires `tokio` or `async-std` feature
 //! - `call_blocking` has no feature requirements
-use std::{any::Any, boxed, future::Future, io, pin::Pin};
+use std::{
+    any::Any,
+    boxed,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 use futures_util::FutureExt;
 
@@ -118,6 +127,14 @@ impl ActorError for io::Error {
     fn from_actor_message(msg: String) -> Self {
         io::Error::other(msg)
     }
+}
+
+/// Represents the current state of an actor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ActorState {
+    #[default]
+    Running,
+    Stopped,
 }
 
 #[cfg(feature = "anyhow")]
@@ -269,14 +286,25 @@ fn actor_loop_panic<E: ActorError>(panic_payload: Box<dyn Any + Send>) -> E {
 }
 
 /// Spawn blocking actor on new thread.
-pub fn spawn_actor_blocking<A, E>(actor: A) -> std::thread::JoinHandle<Result<(), E>>
+#[doc(hidden)]
+pub fn spawn_actor_blocking<A, E>(
+    actor: A,
+    state: Arc<RwLock<ActorState>>,
+) -> std::thread::JoinHandle<Result<(), E>>
 where
     A: ActorSync<E>,
     E: ActorError,
 {
     std::thread::spawn(move || {
         let mut actor = actor;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.run_blocking())) {
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.run_blocking()));
+
+        if let Ok(mut st) = state.write() {
+            *st = ActorState::Stopped;
+        }
+
+        match res {
             Ok(result) => result,
             Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
         }
@@ -285,17 +313,26 @@ where
 
 /// Spawn async actor on tokio runtime.
 #[cfg(all(feature = "tokio", not(feature = "async-std")))]
-pub fn spawn_actor<A, E>(actor: A) -> tokio::task::JoinHandle<Result<(), E>>
+#[doc(hidden)]
+pub fn spawn_actor<A, E>(
+    actor: A,
+    state: Arc<RwLock<ActorState>>,
+) -> tokio::task::JoinHandle<Result<(), E>>
 where
     A: Actor<E>,
     E: ActorError,
 {
     tokio::task::spawn(async move {
         let mut actor = actor;
-        match std::panic::AssertUnwindSafe(async move { actor.run().await })
+        
+        let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
             .catch_unwind()
-            .await
-        {
+            .await;
+
+        if let Ok(mut st) = state.write() {
+            *st = ActorState::Stopped;
+        }
+        match res {
             Ok(result) => result,
             Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
         }
@@ -304,17 +341,25 @@ where
 
 /// Spawn async actor on async-std runtime.
 #[cfg(all(feature = "async-std", not(feature = "tokio")))]
-pub fn spawn_actor<A, E>(actor: A) -> async_std::task::JoinHandle<Result<(), E>>
+#[doc(hidden)]
+pub fn spawn_actor<A, E>(
+    actor: A,
+    state: Arc<RwLock<ActorState>>,
+) -> async_std::task::JoinHandle<Result<(), E>>
 where
     A: Actor<E>,
     E: ActorError,
 {
     async_std::task::spawn(async move {
         let mut actor = actor;
-        match std::panic::AssertUnwindSafe(async move { actor.run().await })
+        
+        let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
             .catch_unwind()
-            .await
-        {
+            .await;
+        if let Ok(mut st) = state.write() {
+            *st = ActorState::Stopped;
+        }
+        match res {
             Ok(result) => result,
             Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
         }
@@ -331,6 +376,7 @@ where
     E: ActorError,
 {
     tx: Sender<Action<A>>,
+    state: Arc<RwLock<ActorState>>,
     _phantom: std::marker::PhantomData<E>,
 }
 
@@ -342,6 +388,7 @@ where
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            state: Arc::clone(&self.state),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -376,14 +423,88 @@ where
     /// let (handle, rx) = Handle::<MyActor, io::Error>::channel();
     /// spawn_actor(MyActor { state: 0, rx });
     /// ```
+    #[doc(hidden)]
     pub fn channel() -> (Self, Receiver<Action<A>>) {
         let (tx, rx) = flume::unbounded::<Action<A>>();
         (
             Self {
                 tx,
+                state: Arc::new(RwLock::new(ActorState::default())),
                 _phantom: std::marker::PhantomData,
             },
             rx,
+        )
+    }
+
+    /// Read the current lifecycle state of the actor.
+    pub fn state(&self) -> ActorState {
+        self.state.read().expect("poisned lock").clone()
+    }
+
+    /// Spawn an async actor (requires tokio or async-std).
+    #[cfg(all(feature = "tokio", not(feature = "async-std")))]
+    pub fn spawn<F>(create_actor: F) -> (Self, tokio::task::JoinHandle<Result<(), E>>)
+    where
+        F: FnOnce(Receiver<Action<A>>) -> A,
+        A: Actor<E>,
+    {
+        let (tx, rx) = flume::unbounded();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+
+        let actor = create_actor(rx);
+        let join_handle = spawn_actor(actor, Arc::clone(&state));
+
+        (
+            Self {
+                tx,
+                state,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
+        )
+    }
+
+    #[cfg(all(feature = "async-std", not(feature = "tokio")))]
+    pub fn spawn<F>(create_actor: F) -> (Self, async_std::task::JoinHandle<Result<(), E>>)
+    where
+        F: FnOnce(Receiver<Action<A>>) -> A,
+        A: Actor<E>,
+    {
+        let (tx, rx) = flume::unbounded();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+
+        let actor = create_actor(rx);
+        let join_handle = spawn_actor(actor, Arc::clone(&state));
+
+        (
+            Self {
+                tx,
+                state,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
+        )
+    }
+
+    /// Spawn a blocking actor on a new OS thread.
+    pub fn spawn_blocking<F>(create_actor: F) -> (Self, std::thread::JoinHandle<Result<(), E>>)
+    where
+        F: FnOnce(Receiver<Action<A>>) -> A,
+        A: ActorSync<E>,
+    {
+        let (tx, rx) = flume::unbounded();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+
+        let actor = create_actor(rx);
+        let join_handle = spawn_actor_blocking(actor, Arc::clone(&state));
+
+        (
+            Self {
+                tx,
+                state,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
         )
     }
 

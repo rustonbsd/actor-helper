@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{Actor, Handle, Receiver, act, act_ok, spawn_actor};
+use actor_helper::{Actor, Handle, Receiver, act, act_ok};
 
 // Public API
 pub struct Counter {
@@ -9,9 +9,9 @@ pub struct Counter {
 
 impl Default for Counter {
     fn default() -> Self {
-        let (handle, rx) = Handle::channel();
-        let _join_handle = spawn_actor(CounterActor { value: 0, rx });
-        Self { handle }
+        Self {
+            handle: Handle::spawn(|rx| CounterActor { value: 0, rx }).0,
+        }
     }
 }
 
