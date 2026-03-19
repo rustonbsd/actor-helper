@@ -184,6 +184,7 @@ mod tokio_tests {
         api.stop_actor().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!api.is_running().await);
+        assert!(api.get_value().await.is_err());
     }
 
     struct CounterActor {

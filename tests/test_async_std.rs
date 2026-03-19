@@ -186,6 +186,7 @@ mod async_std_tests {
 
         api.stop_actor().await.unwrap();
         assert!(!api.is_running().await);
+        assert!(api.get_value().await.is_err());
     }
 
     struct CounterActor {
