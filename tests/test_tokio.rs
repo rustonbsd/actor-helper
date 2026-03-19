@@ -296,4 +296,55 @@ mod tokio_tests {
         assert!(error.contains("panic in actor loop"));
         assert!(error.contains("all branches are disabled"));
     }
+
+    #[tokio::test]
+    async fn test_queued_call_errors_when_actor_exits_mid_queue() {
+        let (handle, _join_handle) = Handle::<TestActor, io::Error>::spawn(|rx| TestActor {
+            value: 0,
+            should_stop: false,
+            rx,
+        });
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first_handle = handle.clone();
+        let first_call = tokio::spawn(async move {
+            first_handle
+                .call(act_ok!(actor => async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    actor.should_stop = true;
+                }))
+                .await
+        });
+
+        // Wait until the first action is running so the second call is guaranteed to queue.
+        let _ = entered_rx.await;
+
+        let queued_handle = handle.clone();
+        let queued_call = tokio::spawn(async move {
+            queued_handle
+                .call(act_ok!(actor => async move {
+                    actor.value += 1;
+                }))
+                .await
+        });
+
+        let _ = release_tx.send(());
+
+        let first_result = tokio::time::timeout(std::time::Duration::from_secs(10), first_call)
+            .await
+            .expect("first call timed out")
+            .expect("first task join failed");
+        assert!(first_result.is_ok());
+
+        let queued_result = tokio::time::timeout(std::time::Duration::from_secs(10), queued_call)
+            .await
+            .expect("queued call timed out (possible hang)")
+            .expect("queued task join failed");
+        let err = queued_result.expect_err("queued call should fail when actor exits");
+        let msg = err.to_string();
+        assert!(msg.contains("actor stopped"));
+    }
 }
