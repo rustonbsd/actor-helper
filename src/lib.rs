@@ -523,6 +523,12 @@ where
         F: for<'a> FnOnce(&'a mut A) -> ActorFut<'a, Result<R, E>> + Send + 'static,
         R: Send + 'static,
     {
+        if self.state() != ActorState::Running {
+            return Err(E::from_actor_message(
+                "actor stopped (call attempted while actor state is not running)".to_string(),
+            ));
+        }
+
         let (rtx, rrx) = flume::unbounded();
         let loc = std::panic::Location::caller();
 

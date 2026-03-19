@@ -166,6 +166,7 @@ mod sync_tests {
         api.stop_actor().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!api.is_running());
+        assert!(api.get_value().is_err());
     }
 
     struct CounterActor {
