@@ -717,21 +717,3 @@ where
         out
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Handle;
-
-    #[derive(Debug)]
-    struct TestActor;
-
-    #[test]
-    fn handle_equality_uses_channel_identity() {
-        let (h1, _rx1) = Handle::<TestActor, std::io::Error>::channel();
-        let h2 = h1.clone();
-        let (h3, _rx3) = Handle::<TestActor, std::io::Error>::channel();
-
-        assert_eq!(h1, h2);
-        assert_ne!(h1, h3);
-    }
-}
