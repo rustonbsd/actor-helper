@@ -19,12 +19,6 @@ impl Counter {
     pub fn new() -> Self {
         Self::default()
     }
-}
-
-impl Counter {
-    pub fn new() -> Self {
-        Self::default()
-    }
 
     pub async fn increment(&self, by: i32) -> io::Result<()> {
         self.handle
