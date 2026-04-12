@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{Actor, Handle, Receiver, act, act_ok};
+use actor_helper::{Handle, act, act_ok};
 
 // Public API
 pub struct Counter {
@@ -10,7 +10,7 @@ pub struct Counter {
 impl Default for Counter {
     fn default() -> Self {
         Self {
-            handle: Handle::spawn(|rx| CounterActor { value: 0, rx }).0,
+            handle: Handle::spawn(CounterActor { value: 0 }).0,
         }
     }
 }
@@ -48,26 +48,16 @@ impl Counter {
             }))
             .await
     }
+    
+    pub async fn stop(&self) {
+        self.handle.shutdown();
+        self.handle.wait_stopped().await;
+    }
 }
 
 // Private actor implementation
 struct CounterActor {
     value: i32,
-    rx: Receiver<actor_helper::Action<CounterActor>>,
-}
-
-impl Actor<io::Error> for CounterActor {
-    async fn run(&mut self) -> io::Result<()> {
-        loop {
-            tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
-                    action(self).await;
-                },
-                else => break,
-            }
-        }
-        Err(io::Error::other("Actor stopped"))
-    }
 }
 
 #[tokio::main]
@@ -79,6 +69,10 @@ pub async fn main() -> io::Result<()> {
 
     counter.set_positive(10).await?;
     println!("Value: {}", counter.get().await?);
+
+    counter.stop().await;
+
+    assert_eq!(counter.handle.state(), actor_helper::ActorState::Stopped);
 
     Ok(())
 }
