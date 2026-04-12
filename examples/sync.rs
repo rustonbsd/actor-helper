@@ -1,6 +1,6 @@
 use std::io;
 
-use actor_helper::{ActorSync, Handle, Receiver, act, act_ok, block_on};
+use actor_helper::{Handle, act, act_ok};
 
 // Public API
 pub struct Counter {
@@ -10,7 +10,10 @@ pub struct Counter {
 impl Default for Counter {
     fn default() -> Self {
         Self {
-            handle: Handle::spawn_blocking(|rx| CounterActor { value: 0, rx }).0,
+            handle: Handle::spawn_blocking(CounterActor {
+                value: 0,
+            })
+            .0,
         }
     }
 }
@@ -42,22 +45,16 @@ impl Counter {
             }
         }))
     }
+
+    pub fn stop(&self) {
+        self.handle.shutdown();
+        self.handle.wait_stopped_blocking();
+    }
 }
 
 // Private actor implementation
 struct CounterActor {
     value: i32,
-    rx: Receiver<actor_helper::Action<CounterActor>>,
-}
-
-impl ActorSync<io::Error> for CounterActor {
-    fn run_blocking(&mut self) -> Result<(), io::Error> {
-        loop {
-            if let Ok(action) = self.rx.recv() {
-                block_on(action(self));
-            }
-        }
-    }
 }
 
 pub fn main() -> io::Result<()> {
@@ -68,6 +65,10 @@ pub fn main() -> io::Result<()> {
 
     counter.set_positive(10)?;
     println!("Value: {}", counter.get()?);
+
+    counter.stop();
+
+    assert_eq!(counter.handle.state(), actor_helper::ActorState::Stopped);
 
     Ok(())
 }

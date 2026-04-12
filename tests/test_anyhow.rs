@@ -3,23 +3,11 @@
 mod anyhow_tests {
     use std::sync::Arc;
 
-    use actor_helper::{Action, ActorSync, Handle, Receiver, block_on};
+    use actor_helper::Handle;
     use actor_helper::{act, act_ok};
 
     struct TestActor {
         value: i32,
-        rx: Receiver<Action<TestActor>>,
-    }
-
-    impl ActorSync<anyhow::Error> for TestActor {
-        fn run_blocking(&mut self) -> Result<(), anyhow::Error> {
-            loop {
-                if let Ok(action) = self.rx.recv() {
-                    println!("Received an action");
-                    block_on(action(self));
-                }
-            }
-        }
     }
 
     struct TestApi {
@@ -29,7 +17,7 @@ mod anyhow_tests {
     impl TestApi {
         fn new() -> Self {
             Self {
-                handle: Handle::spawn_blocking(|rx| TestActor { value: 0, rx }).0,
+                handle: Handle::spawn_blocking(TestActor { value: 0 }).0,
             }
         }
 
@@ -146,23 +134,12 @@ mod anyhow_tests {
 
     struct CounterActor {
         count: i32,
-        rx: Receiver<Action<CounterActor>>,
-    }
-
-    impl ActorSync<anyhow::Error> for CounterActor {
-        fn run_blocking(&mut self) -> anyhow::Result<()> {
-            while let Ok(action) = self.rx.recv() {
-                block_on(action(self));
-            }
-            Ok(())
-        }
     }
 
     #[test]
     fn test_shared_state() {
-        let (handle, _) = Handle::<CounterActor, anyhow::Error>::spawn_blocking(|rx| {
-            CounterActor { count: 0, rx }
-        });
+        let (handle, _) =
+            Handle::<CounterActor, anyhow::Error>::spawn_blocking(CounterActor { count: 0 });
 
         handle
             .call_blocking(act_ok!(actor => async move {
@@ -195,7 +172,7 @@ mod anyhow_tests {
     #[test]
     fn test_multiple_handles_same_actor() {
         let (handle1, _) =
-            Handle::<TestActor, anyhow::Error>::spawn_blocking(|rx| TestActor { value: 0, rx });
+            Handle::<TestActor, anyhow::Error>::spawn_blocking(TestActor { value: 0 });
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
 
@@ -214,19 +191,19 @@ mod anyhow_tests {
 
     struct PanicActor;
 
-    impl ActorSync<anyhow::Error> for PanicActor {
-        fn run_blocking(&mut self) -> Result<(), anyhow::Error> {
-            panic!("blocking actor panic");
-        }
-    }
-
     #[test]
     fn test_actor_loop_panic_is_returned_as_error() {
-        let (_handle, join_handle) =
-            Handle::<PanicActor, anyhow::Error>::spawn_blocking(|_| PanicActor);
-        let result = join_handle.join().unwrap();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
 
+        let (_handle, join_handle) =
+            Handle::<PanicActor, anyhow::Error>::spawn_blocking_with(PanicActor, |_, _| {
+                panic!("blocking actor panic");
+            });
+        let result = join_handle.join().unwrap();
         let error = result.unwrap_err().to_string();
+
+        std::panic::set_hook(prev);
         assert!(error.contains("panic in actor loop"));
         assert!(error.contains("blocking actor panic"));
     }

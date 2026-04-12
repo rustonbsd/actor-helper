@@ -1,27 +1,12 @@
 use std::io;
 
-use actor_helper::{Action, Actor, Handle, Receiver};
+use actor_helper::Handle;
 
-struct FragileActor {
-    rx: Receiver<Action<FragileActor>>,
-}
-
-impl Actor<io::Error> for FragileActor {
-    async fn run(&mut self) -> io::Result<()> {
-        loop {
-            tokio::select! {
-                Ok(action) = self.rx.recv_async() => {
-                    action(self).await;
-                }
-                else => break Ok(()),
-            }
-        }
-    }
-}
+struct FragileActor;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let (handle, join_handle) = Handle::<FragileActor, io::Error>::spawn(|rx| FragileActor { rx });
+    let (handle, join_handle) = Handle::<FragileActor, io::Error>::spawn(FragileActor);
 
     println!("Press Ctrl+C to drop the last handle and shut the actor down.");
 
