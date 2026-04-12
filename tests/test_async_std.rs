@@ -4,26 +4,11 @@ mod async_std_tests {
 
     use std::{io, sync::Arc};
 
-    use actor_helper::{Action, Actor, ActorState, Handle, Receiver};
+    use actor_helper::{ActorState, Handle};
     use actor_helper::{act, act_ok};
 
     struct TestActor {
         value: i32,
-        should_stop: bool,
-        rx: Receiver<Action<TestActor>>,
-    }
-
-    impl Actor<io::Error> for TestActor {
-        async fn run(&mut self) -> io::Result<()> {
-            while !self.should_stop {
-                if let Ok(action) = self.rx.recv_async().await {
-                    action(self).await;
-                } else {
-                    break;
-                }
-            }
-            Ok(())
-        }
     }
 
     struct TestApi {
@@ -33,21 +18,13 @@ mod async_std_tests {
     impl TestApi {
         fn new() -> Self {
             Self {
-                handle: Handle::spawn(|rx| TestActor {
-                    value: 0,
-                    should_stop: false,
-                    rx,
-                })
-                .0,
+                handle: Handle::spawn(TestActor { value: 0 }).0,
             }
         }
 
-        async fn stop_actor(&self) -> io::Result<()> {
-            self.handle
-                .call(act_ok!(actor => async move {
-                    actor.should_stop = true;
-                }))
-                .await
+        async fn stop_actor(&self) {
+            self.handle.shutdown();
+            self.handle.wait_stopped().await;
         }
 
         async fn set_value(&self, value: i32) -> io::Result<()> {
@@ -184,32 +161,18 @@ mod async_std_tests {
 
         assert!(api.is_running().await);
 
-        api.stop_actor().await.unwrap();
+        api.stop_actor().await;
         assert!(!api.is_running().await);
         assert!(api.get_value().await.is_err());
     }
 
     struct CounterActor {
         count: i32,
-        rx: Receiver<Action<CounterActor>>,
-    }
-
-    impl Actor<io::Error> for CounterActor {
-        async fn run(&mut self) -> io::Result<()> {
-            loop {
-                tokio::select! {
-                    Ok(action) = self.rx.recv_async() => {
-                        action(self).await;
-                    }
-                }
-            }
-        }
     }
 
     #[async_std::test]
     async fn test_shared_state() {
-        let (handle, _) =
-            Handle::<CounterActor, io::Error>::spawn(|rx| CounterActor { count: 0, rx });
+        let (handle, _) = Handle::<CounterActor, io::Error>::spawn(CounterActor { count: 0 });
 
         handle
             .call(act_ok!(actor => async move {
@@ -245,11 +208,7 @@ mod async_std_tests {
 
     #[async_std::test]
     async fn test_multiple_handles_same_actor() {
-        let (handle1, _) = Handle::<TestActor, io::Error>::spawn(|rx| TestActor {
-            value: 0,
-            should_stop: false,
-            rx,
-        });
+        let (handle1, _) = Handle::<TestActor, io::Error>::spawn(TestActor { value: 0 });
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
 
@@ -269,33 +228,26 @@ mod async_std_tests {
         assert_eq!(result, 20);
     }
 
-    struct PanicOnDisconnectActor {
-        rx: Receiver<Action<PanicOnDisconnectActor>>,
-    }
-
-    impl Actor<io::Error> for PanicOnDisconnectActor {
-        async fn run(&mut self) -> io::Result<()> {
-            loop {
-                tokio::select! {
-                    Ok(action) = self.rx.recv_async() => {
-                        action(self).await;
-                    }
-                }
-            }
-        }
-    }
+    struct PanicOnDisconnectActor;
 
     #[async_std::test]
     async fn test_actor_loop_panic_is_returned_as_error() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
         let join_handle = {
-            let (handle, join_handle) = Handle::spawn(|rx| PanicOnDisconnectActor { rx });
+            let (handle, join_handle) = Handle::<PanicOnDisconnectActor, io::Error>::spawn_with(
+                PanicOnDisconnectActor,
+                |_actor, _rx| async { panic!("blocking actor panic") },
+            );
             drop(handle);
             join_handle
         };
 
         let result = join_handle.await;
         let error = result.unwrap_err().to_string();
+
+        std::panic::set_hook(prev);
         assert!(error.contains("panic in actor loop"));
-        assert!(error.contains("all branches are disabled"));
+        assert!(error.contains("blocking actor panic"));
     }
 }

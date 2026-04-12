@@ -4,26 +4,11 @@ mod tokio_tests {
 
     use std::{io, sync::Arc};
 
-    use actor_helper::{Action, Actor, Handle, Receiver};
+    use actor_helper::Handle;
     use actor_helper::{act, act_ok};
 
     struct TestActor {
         value: i32,
-        should_stop: bool,
-        rx: Receiver<Action<TestActor>>,
-    }
-
-    impl Actor<io::Error> for TestActor {
-        async fn run(&mut self) -> io::Result<()> {
-            while !self.should_stop {
-                tokio::select! {
-                    Ok(action) = self.rx.recv_async() => {
-                        action(self).await;
-                    }
-                }
-            }
-            Ok(())
-        }
     }
 
     struct TestApi {
@@ -33,21 +18,13 @@ mod tokio_tests {
     impl TestApi {
         fn new() -> Self {
             Self {
-                handle: Handle::spawn(|rx| TestActor {
-                    value: 0,
-                    should_stop: false,
-                    rx,
-                })
-                .0,
+                handle: Handle::spawn(TestActor { value: 0 }).0,
             }
         }
 
-        async fn stop_actor(&self) -> io::Result<()> {
-            self.handle
-                .call(act_ok!(actor => async move {
-                    actor.should_stop = true;
-                }))
-                .await
+        async fn stop_actor(&self) {
+            self.handle.shutdown();
+            self.handle.wait_stopped().await;
         }
 
         async fn set_value(&self, value: i32) -> io::Result<()> {
@@ -181,33 +158,18 @@ mod tokio_tests {
         let api = TestApi::new();
         assert!(api.is_running().await);
 
-        api.stop_actor().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        api.stop_actor().await;
         assert!(!api.is_running().await);
         assert!(api.get_value().await.is_err());
     }
 
     struct CounterActor {
         count: i32,
-        rx: Receiver<Action<CounterActor>>,
-    }
-
-    impl Actor<io::Error> for CounterActor {
-        async fn run(&mut self) -> io::Result<()> {
-            loop {
-                tokio::select! {
-                    Ok(action) = self.rx.recv_async() => {
-                        action(self).await;
-                    }
-                }
-            }
-        }
     }
 
     #[tokio::test]
     async fn test_shared_state() {
-        let (handle, _) =
-            Handle::<CounterActor, io::Error>::spawn(|rx| CounterActor { count: 0, rx });
+        let (handle, _) = Handle::<CounterActor, io::Error>::spawn(CounterActor { count: 0 });
 
         handle
             .call(act_ok!(actor => async move {
@@ -243,11 +205,7 @@ mod tokio_tests {
 
     #[tokio::test]
     async fn test_multiple_handles_same_actor() {
-        let (handle1, _) = Handle::<TestActor, io::Error>::spawn(|rx| TestActor {
-            value: 0,
-            should_stop: false,
-            rx,
-        });
+        let (handle1, _) = Handle::<TestActor, io::Error>::spawn(TestActor { value: 0 });
         let handle2 = handle1.clone();
         let handle3 = handle1.clone();
 
@@ -267,43 +225,39 @@ mod tokio_tests {
         assert_eq!(result, 20);
     }
 
-    struct PanicOnDisconnectActor {
-        rx: Receiver<Action<PanicOnDisconnectActor>>,
-    }
-
-    impl Actor<io::Error> for PanicOnDisconnectActor {
-        async fn run(&mut self) -> io::Result<()> {
-            loop {
-                tokio::select! {
-                    Ok(action) = self.rx.recv_async() => {
-                        action(self).await;
-                    }
-                    // intentionally leaving out fall back branch to trigger panic when all handles are dropped
-                    //else => break Ok(()),
-                }
-            }
-        }
-    }
+    struct PanicOnDisconnectActor;
 
     #[tokio::test]
     async fn test_actor_loop_panic_is_returned_as_error() {
-        let (handle, join_handle) =
-            Handle::<PanicOnDisconnectActor, io::Error>::spawn(|rx| PanicOnDisconnectActor { rx });
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (handle, join_handle) = Handle::<PanicOnDisconnectActor, io::Error>::spawn_with(
+            PanicOnDisconnectActor,
+            |mut actor, rx| async move {
+                loop {
+                    tokio::select! {
+                        Ok(action) = rx.recv_async() => {
+                            action(&mut actor).await;
+                        }
+                        // intentionally leaving out fall back branch to trigger panic when all handles are dropped
+                        //else => break Ok(()),
+                    }
+                }
+            },
+        );
         drop(handle);
 
         let result = join_handle.await.unwrap();
         let error = result.unwrap_err().to_string();
+
+        std::panic::set_hook(prev);
         assert!(error.contains("panic in actor loop"));
         assert!(error.contains("all branches are disabled"));
     }
 
     #[tokio::test]
     async fn test_queued_call_errors_when_actor_exits_mid_queue() {
-        let (handle, _join_handle) = Handle::<TestActor, io::Error>::spawn(|rx| TestActor {
-            value: 0,
-            should_stop: false,
-            rx,
-        });
+        let (handle, _join_handle) = Handle::<TestActor, io::Error>::spawn(TestActor { value: 0 });
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -314,13 +268,15 @@ mod tokio_tests {
                 .call(act_ok!(actor => async move {
                     let _ = entered_tx.send(());
                     let _ = release_rx.await;
-                    actor.should_stop = true;
                 }))
                 .await
         });
 
-        // Wait until the first action is running so the second call is guaranteed to queue.
+        // Wait until the first action is running so the actor is busy.
         let _ = entered_rx.await;
+
+        // Shutdown the handle, the channel sender is dropped, no new sends possible.
+        handle.shutdown();
 
         let queued_handle = handle.clone();
         let queued_call = tokio::spawn(async move {
@@ -343,7 +299,7 @@ mod tokio_tests {
             .await
             .expect("queued call timed out (possible hang)")
             .expect("queued task join failed");
-        let err = queued_result.expect_err("queued call should fail when actor exits");
+        let err = queued_result.expect_err("queued call should fail when handle is shut down");
         let msg = err.to_string();
         assert!(msg.contains("actor stopped"));
     }

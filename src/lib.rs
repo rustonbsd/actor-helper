@@ -6,7 +6,7 @@
 //!
 //! ```rust,ignore
 //! use std::io;
-//! use actor_helper::{Actor, Handle, Receiver, act_ok, spawn_actor};
+//! use actor_helper::{Handle, act_ok};
 //!
 //! // Public API
 //! pub struct Counter {
@@ -15,7 +15,7 @@
 //!
 //! impl Counter {
 //!     pub fn new() -> Self {
-//!         Self { handle: Handle::spawn(|rx| CounterActor { value: 0, rx }) }
+//!         Self { handle: Handle::spawn(CounterActor { value: 0 }).0 }
 //!     }
 //!
 //!     pub async fn increment(&self, by: i32) -> io::Result<()> {
@@ -36,18 +36,6 @@
 //! // Private actor
 //! struct CounterActor {
 //!     value: i32,
-//!     rx: Receiver<actor_helper::Action<CounterActor>>,
-//! }
-//!
-//! impl Actor<io::Error> for CounterActor {
-//!     async fn run(&mut self) -> io::Result<()> {
-//!         loop {
-//!             tokio::select! {
-//!                 Ok(action) = self.rx.recv_async() => action(self).await,
-//!                 else => break Ok(()),
-//!             }
-//!         }
-//!     }
 //! }
 //! ```
 //!
@@ -62,20 +50,30 @@
 //! # Blocking/Sync
 //!
 //! ```rust,ignore
-//! use actor_helper::{ActorSync, block_on};
+//! // Use spawn_blocking and call_blocking instead of spawn and call
+//! let (handle, _) = Handle::<MyActor, io::Error>::spawn_blocking(MyActor { value: 0 });
+//! handle.call_blocking(act_ok!(actor => async move { actor.value }))?;
+//! ```
 //!
-//! impl ActorSync<io::Error> for CounterActor {
-//!     fn run_blocking(&mut self) -> io::Result<()> {
+//! # Custom Loops
+//!
+//! Use `spawn_with` / `spawn_blocking_with` for custom receive loops (e.g. `tokio::select!`):
+//!
+//! ```rust,ignore
+//! use actor_helper::{Handle, Receiver, Action};
+//!
+//! let (handle, _) = Handle::<MyActor, io::Error>::spawn_with(
+//!     MyActor { value: 0 },
+//!     |mut actor, rx| async move {
 //!         loop {
-//!             if let Ok(action) = self.rx.recv() {
-//!                 block_on(action(self));
+//!             tokio::select! {
+//!                 Ok(action) = rx.recv_async() => action(&mut actor).await,
+//!                 _ = some_background_task() => { /* ... */ },
+//!                 else => break Ok(()),
 //!             }
 //!         }
-//!     }
-//! }
-//!
-//! // Use call_blocking instead of call
-//! handle.call_blocking(act_ok!(actor => async move { actor.value }))?;
+//!     },
+//! );
 //! ```
 //!
 //! # Notes
@@ -97,6 +95,7 @@ use std::{
     },
 };
 
+#[allow(unused_imports)]
 use futures_util::{
     FutureExt,
     future::{self, Either},
@@ -111,7 +110,7 @@ pub type Sender<T> = flume::Sender<T>;
 /// Use `recv()` for blocking or `recv_async()` for async.
 pub type Receiver<T> = flume::Receiver<T>;
 
-/// Execute async futures in blocking context. Required for `ActorSync`.
+/// Execute async futures in blocking context.
 pub use futures_executor::block_on;
 
 /// Convert panic/actor-stop messages into your error type.
@@ -250,43 +249,7 @@ macro_rules! act_ok {
     ($actor:ident => $body:block) => {{ move |$actor| $crate::into_actor_fut_ok($body) }};
 }
 
-/// Async actor trait. Loop forever receiving and executing actions.
-///
-/// # Example
-/// ```rust,ignore
-/// impl Actor<io::Error> for MyActor {
-///     async fn run(&mut self) -> io::Result<()> {
-///         loop {
-///             tokio::select! {
-///                 Ok(action) = self.rx.recv_async() => action(self).await,
-///                 else => break Ok(()),
-///             }
-///         }
-///         Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
-///     }
-/// }
-/// ```
-#[cfg(any(feature = "tokio", feature = "async-std"))]
-pub trait Actor<E>: Send + 'static {
-    fn run(&mut self) -> impl Future<Output = Result<(), E>> + Send;
-}
 
-/// Blocking actor trait. Loop receiving actions with `recv()` and executing them with `block_on()`.
-///
-/// # Example
-/// ```rust,ignore
-/// impl ActorSync<io::Error> for MyActor {
-///     fn run_blocking(&mut self) -> io::Result<()> {
-///         while let Ok(action) = self.rx.recv() {
-///             block_on(action(self));
-///         }
-///         Err(io::Error::new(io::ErrorKind::Other, "Actor stopped"))
-///     }
-/// }
-/// ```
-pub trait ActorSync<E>: Send + 'static {
-    fn run_blocking(&mut self) -> Result<(), E>;
-}
 
 fn panic_payload_message(panic_payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = panic_payload.downcast_ref::<&str>() {
@@ -305,92 +268,6 @@ fn actor_loop_panic<E: ActorError>(panic_payload: Box<dyn Any + Send>) -> E {
     ))
 }
 
-/// Spawn blocking actor on new thread.
-#[doc(hidden)]
-pub fn spawn_actor_blocking<A, E>(
-    actor: A,
-    state: Arc<RwLock<ActorState>>,
-    pending: PendingCancelMap,
-) -> std::thread::JoinHandle<Result<(), E>>
-where
-    A: ActorSync<E>,
-    E: ActorError,
-{
-    std::thread::spawn(move || {
-        let mut actor = actor;
-
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.run_blocking()));
-
-        if let Ok(mut st) = state.write() {
-            *st = ActorState::Stopped;
-        }
-        fail_pending_calls(&pending);
-
-        match res {
-            Ok(result) => result,
-            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
-        }
-    })
-}
-
-/// Spawn async actor on tokio runtime.
-#[cfg(all(feature = "tokio", not(feature = "async-std")))]
-#[doc(hidden)]
-pub fn spawn_actor<A, E>(
-    actor: A,
-    state: Arc<RwLock<ActorState>>,
-    pending: PendingCancelMap,
-) -> tokio::task::JoinHandle<Result<(), E>>
-where
-    A: Actor<E>,
-    E: ActorError,
-{
-    tokio::task::spawn(async move {
-        let mut actor = actor;
-
-        let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
-            .catch_unwind()
-            .await;
-
-        if let Ok(mut st) = state.write() {
-            *st = ActorState::Stopped;
-        }
-        fail_pending_calls(&pending);
-        match res {
-            Ok(result) => result,
-            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
-        }
-    })
-}
-
-/// Spawn async actor on async-std runtime.
-#[cfg(all(feature = "async-std", not(feature = "tokio")))]
-#[doc(hidden)]
-pub fn spawn_actor<A, E>(
-    actor: A,
-    state: Arc<RwLock<ActorState>>,
-    pending: PendingCancelMap,
-) -> async_std::task::JoinHandle<Result<(), E>>
-where
-    A: Actor<E>,
-    E: ActorError,
-{
-    async_std::task::spawn(async move {
-        let mut actor = actor;
-
-        let res = std::panic::AssertUnwindSafe(async move { actor.run().await })
-            .catch_unwind()
-            .await;
-        if let Ok(mut st) = state.write() {
-            *st = ActorState::Stopped;
-        }
-        fail_pending_calls(&pending);
-        match res {
-            Ok(result) => result,
-            Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
-        }
-    })
-}
 
 /// Cloneable handle to send actions to actor `A` with error type `E`.
 ///
@@ -401,10 +278,11 @@ where
     A: Send + 'static,
     E: ActorError,
 {
-    tx: Sender<Action<A>>,
+    tx: Arc<Mutex<Option<Sender<Action<A>>>>>,
     state: Arc<RwLock<ActorState>>,
     pending: PendingCancelMap,
     next_call_id: Arc<AtomicU64>,
+    stopped_rx: Receiver<()>,
     _phantom: std::marker::PhantomData<E>,
 }
 
@@ -415,10 +293,11 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
+            tx: Arc::clone(&self.tx),
             state: Arc::clone(&self.state),
             pending: Arc::clone(&self.pending),
             next_call_id: Arc::clone(&self.next_call_id),
+            stopped_rx: self.stopped_rx.clone(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -430,7 +309,7 @@ where
     E: ActorError,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.tx.same_channel(&other.tx)
+        Arc::ptr_eq(&self.state, &other.state)
     }
 }
 
@@ -446,106 +325,309 @@ where
     A: Send + 'static,
     E: ActorError,
 {
-    /// Create handle and receiver.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let (handle, rx) = Handle::<MyActor, io::Error>::channel();
-    /// spawn_actor(MyActor { state: 0, rx });
-    /// ```
-    #[doc(hidden)]
-    pub fn channel() -> (Self, Receiver<Action<A>>) {
-        let (tx, rx) = flume::unbounded::<Action<A>>();
-        (
-            Self {
-                tx,
-                state: Arc::new(RwLock::new(ActorState::default())),
-                pending: Arc::new(Mutex::new(HashMap::new())),
-                next_call_id: Arc::new(AtomicU64::new(0)),
-                _phantom: std::marker::PhantomData,
-            },
-            rx,
-        )
-    }
-
     /// Read the current lifecycle state of the actor.
     pub fn state(&self) -> ActorState {
         self.state.read().expect("poisned lock").clone()
     }
 
-    /// Spawn an async actor (requires tokio or async-std).
+    /// Spawn an async actor with the default message loop (requires tokio or async-std).
+    ///
+    /// The library runs: receive action → execute → repeat, until the channel disconnects.
+    /// Use [`spawn_with`](Self::spawn_with) for custom receive loops.
     #[cfg(all(feature = "tokio", not(feature = "async-std")))]
-    pub fn spawn<F>(create_actor: F) -> (Self, tokio::task::JoinHandle<Result<(), E>>)
-    where
-        F: FnOnce(Receiver<Action<A>>) -> A,
-        A: Actor<E>,
+    pub fn spawn(actor: A) -> (Self, tokio::task::JoinHandle<Result<(), E>>)
     {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = flume::unbounded::<Action<A>>();
         let state = Arc::new(RwLock::new(ActorState::default()));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
 
-        let actor = create_actor(rx);
-        let join_handle = spawn_actor(actor, Arc::clone(&state), Arc::clone(&pending));
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            tokio::task::spawn(async move {
+                let _stopped_signal = stopped_tx;
+                let mut actor = actor;
+
+                let res = std::panic::AssertUnwindSafe(async {
+                    while let Ok(action) = rx.recv_async().await {
+                        action(&mut actor).await;
+                    }
+                    Ok::<(), E>(())
+                })
+                .catch_unwind()
+                .await;
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
 
         (
             Self {
-                tx,
+                tx: Arc::new(Mutex::new(Some(tx))),
                 state,
                 pending,
                 next_call_id,
+                stopped_rx,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
         )
     }
 
+    /// Spawn an async actor with a custom run loop (requires tokio).
+    ///
+    /// The closure receives ownership of the actor and the action receiver.
+    /// Use `action(&mut actor).await` to execute received actions.
+    #[cfg(all(feature = "tokio", not(feature = "async-std")))]
+    pub fn spawn_with<F, Fut>(actor: A, run: F) -> (Self, tokio::task::JoinHandle<Result<(), E>>)
+    where
+        F: FnOnce(A, Receiver<Action<A>>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send,
+    {
+        let (tx, rx) = flume::unbounded();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
+
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            tokio::task::spawn(async move {
+                let _stopped_signal = stopped_tx;
+
+                let res = std::panic::AssertUnwindSafe(run(actor, rx))
+                    .catch_unwind()
+                    .await;
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
+
+        (
+            Self {
+                tx: Arc::new(Mutex::new(Some(tx))),
+                state,
+                pending,
+                next_call_id,
+                stopped_rx,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
+        )
+    }
+
+    /// Spawn an async actor with the default message loop (requires async-std).
+    ///
+    /// The library runs: receive action → execute → repeat, until the channel disconnects.
+    /// Use [`spawn_with`](Self::spawn_with) for custom receive loops.
     #[cfg(all(feature = "async-std", not(feature = "tokio")))]
-    pub fn spawn<F>(create_actor: F) -> (Self, async_std::task::JoinHandle<Result<(), E>>)
-    where
-        F: FnOnce(Receiver<Action<A>>) -> A,
-        A: Actor<E>,
+    pub fn spawn(actor: A) -> (Self, async_std::task::JoinHandle<Result<(), E>>)
     {
-        let (tx, rx) = flume::unbounded();
+        let (tx, rx) = flume::unbounded::<Action<A>>();
         let state = Arc::new(RwLock::new(ActorState::default()));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
 
-        let actor = create_actor(rx);
-        let join_handle = spawn_actor(actor, Arc::clone(&state), Arc::clone(&pending));
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            async_std::task::spawn(async move {
+                let _stopped_signal = stopped_tx;
+                let mut actor = actor;
+
+                let res = std::panic::AssertUnwindSafe(async {
+                    while let Ok(action) = rx.recv_async().await {
+                        action(&mut actor).await;
+                    }
+                    Ok::<(), E>(())
+                })
+                .catch_unwind()
+                .await;
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
 
         (
             Self {
-                tx,
+                tx: Arc::new(Mutex::new(Some(tx))),
                 state,
                 pending,
                 next_call_id,
+                stopped_rx,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
         )
     }
 
-    /// Spawn a blocking actor on a new OS thread.
-    pub fn spawn_blocking<F>(create_actor: F) -> (Self, std::thread::JoinHandle<Result<(), E>>)
+    /// Spawn an async actor with a custom run loop (requires async-std).
+    ///
+    /// The closure receives ownership of the actor and the action receiver.
+    /// Use `action(&mut actor).await` to execute received actions.
+    #[cfg(all(feature = "async-std", not(feature = "tokio")))]
+    pub fn spawn_with<F, Fut>(actor: A, run: F) -> (Self, async_std::task::JoinHandle<Result<(), E>>)
     where
-        F: FnOnce(Receiver<Action<A>>) -> A,
-        A: ActorSync<E>,
+        F: FnOnce(A, Receiver<Action<A>>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send,
     {
         let (tx, rx) = flume::unbounded();
         let state = Arc::new(RwLock::new(ActorState::default()));
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
 
-        let actor = create_actor(rx);
-        let join_handle = spawn_actor_blocking(actor, Arc::clone(&state), Arc::clone(&pending));
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            async_std::task::spawn(async move {
+                let _stopped_signal = stopped_tx;
+
+                let res = std::panic::AssertUnwindSafe(run(actor, rx))
+                    .catch_unwind()
+                    .await;
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
 
         (
             Self {
-                tx,
+                tx: Arc::new(Mutex::new(Some(tx))),
                 state,
                 pending,
                 next_call_id,
+                stopped_rx,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
+        )
+    }
+
+    /// Spawn a blocking actor with the default message loop on a new OS thread.
+    ///
+    /// The library runs: receive action → execute → repeat, until the channel disconnects.
+    /// Use [`spawn_blocking_with`](Self::spawn_blocking_with) for custom receive loops.
+    pub fn spawn_blocking(actor: A) -> (Self, std::thread::JoinHandle<Result<(), E>>)
+    {
+        let (tx, rx) = flume::unbounded::<Action<A>>();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
+
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                let _stopped_signal = stopped_tx;
+                let mut actor = actor;
+
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(action) = rx.recv() {
+                        block_on(action(&mut actor));
+                    }
+                    Ok::<(), E>(())
+                }));
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
+
+        (
+            Self {
+                tx: Arc::new(Mutex::new(Some(tx))),
+                state,
+                pending,
+                next_call_id,
+                stopped_rx,
+                _phantom: std::marker::PhantomData,
+            },
+            join_handle,
+        )
+    }
+
+    /// Spawn a blocking actor with a custom run loop on a new OS thread.
+    ///
+    /// The closure receives ownership of the actor and the action receiver.
+    /// Use `block_on(action(&mut actor))` to execute received actions.
+    pub fn spawn_blocking_with<F>(actor: A, run: F) -> (Self, std::thread::JoinHandle<Result<(), E>>)
+    where
+        F: FnOnce(A, Receiver<Action<A>>) -> Result<(), E> + Send + 'static,
+    {
+        let (tx, rx) = flume::unbounded();
+        let state = Arc::new(RwLock::new(ActorState::default()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let next_call_id = Arc::new(AtomicU64::new(0));
+        let (stopped_tx, stopped_rx) = flume::bounded::<()>(1);
+
+        let join_handle = {
+            let state = Arc::clone(&state);
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                let _stopped_signal = stopped_tx;
+
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(actor, rx)
+                }));
+
+                if let Ok(mut st) = state.write() {
+                    *st = ActorState::Stopped;
+                }
+                fail_pending_calls(&pending);
+                match res {
+                    Ok(result) => result,
+                    Err(panic_payload) => Err(actor_loop_panic(panic_payload)),
+                }
+            })
+        };
+
+        (
+            Self {
+                tx: Arc::new(Mutex::new(Some(tx))),
+                state,
+                pending,
+                next_call_id,
+                stopped_rx,
                 _phantom: std::marker::PhantomData,
             },
             join_handle,
@@ -573,48 +655,56 @@ where
             .expect("poisoned lock")
             .insert(call_id, cancel_tx);
 
-        self.tx
-            .send(Box::new(move |actor: &mut A| {
-                Box::pin(async move {
-                    // Execute the action and catch any panics
-                    let panic_result = std::panic::AssertUnwindSafe(async move { f(actor).await })
-                        .catch_unwind()
-                        .await;
+        let action: Action<A> = Box::new(move |actor: &mut A| {
+            Box::pin(async move {
+                // Execute the action and catch any panics
+                let panic_result = std::panic::AssertUnwindSafe(async move { f(actor).await })
+                    .catch_unwind()
+                    .await;
 
-                    let res = match panic_result {
-                        Ok(action_result) => action_result,
-                        Err(panic_payload) => {
-                            // Convert panic payload to error message
-                            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                                (*s).to_string()
-                            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            };
-                            Err(E::from_actor_message(format!(
-                                "panic in actor call at {}:{}: {}",
-                                loc.file(),
-                                loc.line(),
-                                msg
-                            )))
-                        }
-                    };
+                let res = match panic_result {
+                    Ok(action_result) => action_result,
+                    Err(panic_payload) => {
+                        // Convert panic payload to error message
+                        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        Err(E::from_actor_message(format!(
+                            "panic in actor call at {}:{}: {}",
+                            loc.file(),
+                            loc.line(),
+                            msg
+                        )))
+                    }
+                };
 
-                    // Send result back to caller (ignore send errors - caller may have dropped)
-                    let _ = rtx.send(res);
-                })
-            }))
-            .map_err(|_| {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.remove(&call_id);
-                }
-                E::from_actor_message(format!(
-                    "actor stopped (call send at {}:{})",
-                    loc.file(),
-                    loc.line()
-                ))
-            })?;
+                // Send result back to caller (ignore send errors - caller may have dropped)
+                let _ = rtx.send(res);
+            })
+        });
+
+        let sent = {
+            let tx_guard = self.tx.lock().expect("poisoned lock");
+            tx_guard
+                .as_ref()
+                .map_or(false, |tx| tx.send(action).is_ok())
+        };
+
+        if !sent {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&call_id);
+            }
+            return Err(E::from_actor_message(format!(
+                "actor stopped (call send at {}:{})",
+                loc.file(),
+                loc.line()
+            )));
+        }
+
         Ok((rrx, cancel_rx, call_id, loc))
     }
 
@@ -716,22 +806,32 @@ where
 
         out
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::Handle;
+    /// Disconnect the action channel, causing the actor's `recv()` to return `Err`.
+    ///
+    /// The actor loop should exit naturally when `recv()` returns `Err`.
+    /// Already-queued messages will be drained before the channel reports disconnection.
+    /// Does nothing if already shut down.
+    pub fn shutdown(&self) {
+        if let Ok(mut tx) = self.tx.lock() {
+            tx.take();
+        }
+    }
 
-    #[derive(Debug)]
-    struct TestActor;
+    /// Block until the actor has stopped. Returns immediately if already stopped.
+    pub fn wait_stopped_blocking(&self) {
+        if self.state() == ActorState::Stopped {
+            return;
+        }
+        let _ = self.stopped_rx.recv();
+    }
 
-    #[test]
-    fn handle_equality_uses_channel_identity() {
-        let (h1, _rx1) = Handle::<TestActor, std::io::Error>::channel();
-        let h2 = h1.clone();
-        let (h3, _rx3) = Handle::<TestActor, std::io::Error>::channel();
-
-        assert_eq!(h1, h2);
-        assert_ne!(h1, h3);
+    /// Wait asynchronously until the actor has stopped. Returns immediately if already stopped.
+    #[cfg(any(feature = "tokio", feature = "async-std"))]
+    pub async fn wait_stopped(&self) {
+        if self.state() == ActorState::Stopped {
+            return;
+        }
+        let _ = self.stopped_rx.recv_async().await;
     }
 }
